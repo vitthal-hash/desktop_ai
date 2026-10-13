@@ -8,6 +8,7 @@ import threading
 import time
 import logging
 from pathlib import Path
+import pc_control
 
 import ollama
 from tools import perform_action
@@ -21,8 +22,8 @@ from vaani_control import (
 )
 from tray_status import start_tray, stop_tray
 
-MODEL = "llama3.2:3b"
-WAKE_PHRASE = "Hey Computer"
+MODEL = "qwen2.5:3b-instruct"
+WAKE_PHRASE = "Hey bro"
 SESSION_IDLE_TIMEOUT_SECONDS = 30
 # These end the multi-command session but retain wake-word detection.
 SLEEP_PHRASES = {
@@ -75,7 +76,10 @@ def answer_question(user_text: str) -> str:
 
 
 def handle_request(user_text: str) -> str:
-    result = perform_action(user_text)
+    result = pc_control.handle(user_text)              # NEW: apps, media, WhatsApp, UIA clicks, multi-step
+    if result is None:
+        result = perform_action(user_text)             # your existing router (unchanged)
+        result = pc_control.rescue(user_text, result)  # NEW: screen agent if router says "unsupported"
     if result is not None:
         success, detail = result
         messages.append({"role": "user", "content": user_text})
@@ -83,6 +87,7 @@ def handle_request(user_text: str) -> str:
         logging.info("ACTION %s: %s => %s", "OK" if success else "FAILED", user_text, detail)
         return detail
     return answer_question(user_text)
+
 
 
 def _normalized(text: str) -> str:

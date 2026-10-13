@@ -25,7 +25,7 @@ from typing import Any, Optional, Tuple
 
 Result = Tuple[bool, str]
 log = logging.getLogger("vaani.tools")
-MODEL = "llama3.2:3b"
+MODEL = "qwen2.5:3b-instruct"
 _pending_action: Optional[dict[str, Any]] = None
 
 ACTIONS = {
