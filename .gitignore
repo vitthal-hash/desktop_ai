@@ -1,0 +1,95 @@
+
+# =========================
+# Python cache and builds
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+wheels/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Environment variables and secrets
+# =========================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+token.json
+
+# =========================
+# Logs and runtime files
+# =========================
+*.log
+logs/
+log/
+*.pid
+*.lock
+
+# =========================
+# Local databases and temporary files
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# IDE and editor settings
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# Testing and coverage
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Local AI models and large binaries
+# =========================
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+models/
+checkpoints/
+
+# =========================
+# Windows installer and local config
+# =========================
+*.spec
+*.msi
+*.exe
