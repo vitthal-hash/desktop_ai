@@ -1,0 +1,16 @@
+{
+  "_help": "Add your own words. aliases: what speech-to-text often hears -> what you really mean. words: names Whisper should listen for (shows, songs, people, apps).",
+  "aliases": {
+    "tmkoc": "Taarak Mehta Ka Ooltah Chashmah",
+    "tmqc": "Taarak Mehta Ka Ooltah Chashmah",
+    "tmcoc": "Taarak Mehta Ka Ooltah Chashmah",
+    "tmkc": "Taarak Mehta Ka Ooltah Chashmah",
+    "tm koc": "Taarak Mehta Ka Ooltah Chashmah",
+    "t m k o c": "Taarak Mehta Ka Ooltah Chashmah",
+    "t m q c": "Taarak Mehta Ka Ooltah Chashmah",
+    "taarak mehta": "Taarak Mehta Ka Ooltah Chashmah",
+    "tarak mehta": "Taarak Mehta Ka Ooltah Chashmah",
+    "kbc": "KBC Kaun Banega Crorepati"
+  },
+  "words": ["Taarak Mehta Ka Ooltah Chashmah", "Arijit Singh", "Believer", "Imagine Dragons", "Claude", "Ollama", "VAANI"]
+}

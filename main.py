@@ -9,6 +9,8 @@ import time
 import logging
 from pathlib import Path
 import pc_control
+import friendly
+import memory
 
 import ollama
 from tools import perform_action
@@ -22,8 +24,8 @@ from vaani_control import (
 )
 from tray_status import start_tray, stop_tray
 
-MODEL = "qwen2.5:3b-instruct"
-WAKE_PHRASE = "Hey bro"
+MODEL = os.getenv("VAANI_MODEL", "qwen2.5:3b-instruct")
+WAKE_PHRASE = "Hey Computer"
 SESSION_IDLE_TIMEOUT_SECONDS = 30
 # These end the multi-command session but retain wake-word detection.
 SLEEP_PHRASES = {
@@ -36,13 +38,16 @@ PAUSE_PHRASES = {
     "pause all listening", "stop microphone",
 }
 SYSTEM_PROMPT = """
-You are VAANI, Chief's personal local AI assistant. Address the user as Chief.
-Your replies are spoken aloud: answer in at most three short, natural sentences in plain
-text (no markdown, lists, emojis or URLs) unless Chief asks for detail.
-Answer ordinary questions using the local Ollama model. Computer actions are
-performed by the Python action layer, not by your text response. Never claim
-an action succeeded unless the action layer confirms it. If a command is
-unsupported, explain that honestly.
+You are VAANI, Chief's personal assistant and friend, like a warm, quick-witted companion sitting beside him.
+Address the user as Chief. Your replies are spoken aloud, so talk the way a kind person talks: short, natural,
+relaxed sentences, contractions, no markdown, lists, emojis or URLs. Usually one or two sentences; three at most
+unless Chief asks for detail.
+Notice how Chief feels. If he sounds sad, stressed, tired or frustrated, respond to the feeling first, gently,
+before anything else. If he is happy, be happy with him. Never lecture, never sound like a robot or a manual,
+never say "as an AI". If you did not understand, ask one short friendly question instead of guessing.
+Computer actions are performed by the Python action layer, not by your text. Never claim an action succeeded
+unless the action layer confirms it. If something is unsupported, say so honestly and suggest what you can do.
+When you mention a website or tab, use its simple name (GitHub, YouTube), never a long title or address.
 """.strip()
 messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -59,11 +64,15 @@ def _configure_logging():
         pass
 
 
-def answer_question(user_text: str) -> str:
+def answer_question(user_text: str, mood: str | None = None) -> str:
     messages.append({"role": "user", "content": user_text})
     try:
-        response = ollama.chat(model=MODEL, messages=messages, keep_alive="30m",
-                               options={"temperature": 0.4, "num_predict": 220})
+        call_messages = list(messages)
+        hint = friendly.mood_hint(mood) if mood else ""
+        if hint:                                          # only for this one call, not kept in the history
+            call_messages.append({"role": "system", "content": hint})
+        response = ollama.chat(model=MODEL, messages=call_messages, keep_alive="30m",
+                               options={"temperature": 0.5, "num_predict": 220})
         answer = (response.message.content or "").strip() or "I couldn't generate a response, Chief."
         messages.append({"role": "assistant", "content": answer})
         logging.info("CHAT: %s => %s", user_text, answer)
@@ -72,10 +81,25 @@ def answer_question(user_text: str) -> str:
         if messages and messages[-1].get("role") == "user":
             messages.pop()
         logging.exception("Ollama request failed")
-        return "Chief, I couldn't connect to Ollama. Check that Ollama is running and llama3.2:3b is installed."
+        return "Chief, I couldn't connect to Ollama. Check that Ollama is running and " + MODEL + " is installed."
 
 
 def handle_request(user_text: str) -> str:
+    mood = friendly.detect_mood(user_text)
+    if mood:
+        logging.info("MOOD: %s", mood)
+    try:                                               # follow-ups: "more", "again", "play this song" after opening YouTube
+        followup = memory.resolve(user_text)
+    except Exception:
+        logging.exception("memory.resolve failed")
+        followup = None
+    if followup:
+        kind, value = followup
+        if kind == "ask":
+            logging.info("FOLLOWUP ask: %s => %s", user_text, value)
+            return value
+        logging.info("FOLLOWUP: %r understood as %r", user_text, value)
+        user_text = value
     result = pc_control.handle(user_text)              # NEW: apps, media, WhatsApp, UIA clicks, multi-step
     if result is None:
         result = perform_action(user_text)             # your existing router (unchanged)
@@ -85,8 +109,14 @@ def handle_request(user_text: str) -> str:
         messages.append({"role": "user", "content": user_text})
         messages.append({"role": "assistant", "content": detail})
         logging.info("ACTION %s: %s => %s", "OK" if success else "FAILED", user_text, detail)
+        try:
+            memory.note(user_text, success, detail)
+        except Exception:
+            logging.exception("memory.note failed")
+        if mood and success and mood != "happy":
+            return friendly.empathy(mood) + " " + detail      # "Take a breath, Chief. We'll get through it. Volume is at 30 percent."
         return detail
-    return answer_question(user_text)
+    return answer_question(user_text, mood)
 
 
 

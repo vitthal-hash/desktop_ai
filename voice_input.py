@@ -1,8 +1,9 @@
 """VAANI speech input (Faster-Whisper): microphone capture, utterance detection, transcription.
 
-Speed settings (env): VAANI_STT_MODEL (default base.en), VAANI_WAKE_MODEL (default tiny.en),
-VAANI_END_SILENCE (seconds of quiet that ends a command, default 0.8).
-Use VAANI_STT_MODEL=base (multilingual) if you speak Hindi or other languages to VAANI.
+Accuracy settings (env): VAANI_STT_MODEL (default small.en; try distil-large-v3 on a GPU or a strong CPU),
+VAANI_WAKE_MODEL (default tiny.en), VAANI_END_SILENCE (quiet that ends a command, default 0.9 s; a sentence that
+stops on a dangling word like "and" / "to" / "open" automatically waits for the rest), VAANI_BEAM (default 5).
+Use VAANI_STT_MODEL=small (multilingual) if you speak Hindi or other languages to VAANI.
 """
 from __future__ import annotations
 
@@ -22,10 +23,21 @@ log = logging.getLogger("vaani.stt")
 
 TARGET_RATE = 16000
 BLOCK = 1024
-STT_MODEL = os.getenv("VAANI_STT_MODEL", "base.en")
+STT_MODEL = os.getenv("VAANI_STT_MODEL", "small.en")
 WAKE_MODEL = os.getenv("VAANI_WAKE_MODEL", "tiny.en")
-END_SILENCE = float(os.getenv("VAANI_END_SILENCE", "0.8"))
-MIN_THRESHOLD = 0.010
+END_SILENCE = float(os.getenv("VAANI_END_SILENCE", "0.9"))
+BEAM = max(1, int(os.getenv("VAANI_BEAM", "5")))
+# Teaches Whisper the words Chief actually says, so "git hub" -> GitHub, "whats app" -> WhatsApp, "volume" not "all you".
+PROMPT = os.getenv("VAANI_STT_PROMPT", (
+    "Voice commands for a computer assistant: open Chrome, new tab, close the current window, switch to the GitHub tab, "
+    "YouTube, WhatsApp, Gmail, Claude, ChatGPT, scroll down, scroll up, volume to 50 percent, brightness to maximum, "
+    "play a song, open the second video, click the first result, go back, search for, take a screenshot, minimize, maximize."))
+# a sentence that ends on one of these is obviously not finished yet
+_DANGLING = {"and", "then", "to", "the", "a", "an", "on", "in", "of", "for", "with", "at", "by", "from", "my", "or", "but",
+             "because", "into", "onto", "set", "make", "turn", "open", "search", "type", "write", "click", "switch",
+             "find", "send", "tell", "call", "message", "number", "than"}
+
+MIN_THRESHOLD = float(os.getenv("VAANI_MIN_THRESHOLD", "0.006"))   # lower = catches quiet / fast starts of words
 HALLUCINATIONS = {"you", "thank you", "thanks", "thanks for watching", "bye", "okay", "ok", "so", "the", "uh", "um", "hmm", "mm"}
 
 _models: dict = {}
@@ -103,7 +115,7 @@ class UtteranceDetector:
     """Feed audio chunks; returns the audio of a finished utterance (speech followed by silence)."""
 
     def __init__(self, rate: int, silence_end: float = END_SILENCE, min_speech: float = 0.25,
-                 max_len: float = 15.0, preroll: float = 0.35):
+                 max_len: float = 15.0, preroll: float = 0.6):
         self.rate, self.silence_end, self.min_speech, self.max_len = rate, silence_end, min_speech, max_len
         self.preroll_chunks = max(1, int(preroll * rate / BLOCK))
         self.floor = 0.003
@@ -157,14 +169,50 @@ def to_16k(audio: np.ndarray, rate: int) -> np.ndarray:
     return resample_poly(audio, TARGET_RATE // g, rate // g).astype(np.float32)
 
 
+def _prepare(audio: np.ndarray) -> np.ndarray:
+    """Remove DC offset and bring quiet speech up to a healthy level (never amplify noise by more than 8x)."""
+    a = np.asarray(audio, dtype=np.float32)
+    if a.size == 0:
+        return a
+    a = a - float(np.mean(a))
+    peak = float(np.max(np.abs(a)))
+    if 1e-4 < peak < 0.5:
+        a = a * min(8.0, 0.7 / peak)
+    return np.clip(a, -1.0, 1.0).astype(np.float32)
+
+
 def transcribe(model, audio_16k: np.ndarray, fast: bool = True, english: bool = True) -> str:
-    segments, _ = model.transcribe(audio_16k, language="en" if english else None,
-                                   beam_size=1 if fast else 3, vad_filter=True, condition_on_previous_text=False,
-                                   no_speech_threshold=0.6, compression_ratio_threshold=2.4)
+    """fast=True (wake word): quickest decode. fast=False (commands): beam search + vocabulary prompt for clean words."""
+    kwargs = dict(language="en" if english else None, condition_on_previous_text=False,
+                  no_speech_threshold=0.6, compression_ratio_threshold=2.4, vad_filter=True,
+                  vad_parameters=dict(threshold=0.35, min_silence_duration_ms=600, speech_pad_ms=400))
+    if fast:
+        segments, _ = model.transcribe(audio_16k, beam_size=1, **kwargs)
+    else:
+        hints = ""
+        try:
+            import vocab
+            hints = ", ".join(vocab.hint_words())[:300]
+        except Exception:
+            pass
+        prompt = (PROMPT + " " + hints).strip()
+        try:                                              # hotwords nudges Whisper toward YOUR names (newer faster-whisper)
+            segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, initial_prompt=prompt,
+                                           hotwords=hints or None, **kwargs)
+        except TypeError:
+            segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, initial_prompt=prompt, **kwargs)
     text = " ".join(s.text.strip() for s in segments).strip()
     if text.lower().strip(" .!?,") in HALLUCINATIONS:
         return ""
+    if not fast and PROMPT and text.strip().lower() in PROMPT.lower() and len(text.split()) > 6:
+        return ""                                   # Whisper sometimes just echoes its own prompt on silence
     return text
+
+
+def _unfinished(text: str) -> bool:
+    """True when the sentence clearly stopped mid-thought ('open the', 'volume to', 'and')."""
+    words = [w for w in text.lower().replace(",", " ").replace(".", " ").split() if w]
+    return bool(words) and words[-1] in _DANGLING and not text.rstrip().endswith(("?", "!"))
 
 
 def capture_utterance(max_wait=None, silence_end: float = END_SILENCE, max_len: float = 15.0, verify: bool = True):
@@ -208,9 +256,29 @@ def listen_once(auto_stop: bool = False, max_wait_seconds=None):
     if not auto_stop:
         return _push_to_talk(model)
     audio = capture_utterance(max_wait=max_wait_seconds)
-    text = transcribe(model, audio, fast=True, english=STT_MODEL.endswith(".en"))
+    english = STT_MODEL.endswith(".en")
+    text = transcribe(model, audio, fast=False, english=english)
     if not text:
         return None
+    for _ in range(2):                              # natural speech has pauses: "open the ... second video"
+        if not _unfinished(text):
+            break
+        try:
+            more = capture_utterance(max_wait=2.5, silence_end=END_SILENCE, verify=False)
+        except (TimeoutError, ListeningPaused):
+            break
+        extra = transcribe(model, more, fast=False, english=english)
+        if not extra:
+            break
+        text = (text.rstrip(" .,") + " " + extra).strip()
+    try:
+        import vocab
+        fixed = vocab.apply(text)                         # "tmqc" -> "Taarak Mehta Ka Ooltah Chashmah"
+        if fixed != text:
+            print(f"[VAANI vocabulary] {text}  ->  {fixed}", flush=True)
+        text = fixed
+    except Exception:
+        pass
     print(f"[VAANI recognised] {text}", flush=True)
     return text
 
