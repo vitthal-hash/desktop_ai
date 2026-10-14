@@ -805,11 +805,15 @@ def _single(step: str) -> Optional[Result]:
     m = re.fullmatch(r"(force close|kill|force quit|terminate) (?:the )?(.+?)(?: app| application| window)?", t)
     if m and m.group(2) not in {"tab", "this", "it"}:
         return close_app(m.group(2), force=True)
-    m = re.fullmatch(r"(?:close|quit|exit|shut down|shutdown) (?:the )?(.+?)(?: app| application| window| program)?", t)
+    m = re.fullmatch(r"(?:close|quit|exit|shut down|shutdown) (?:the )?(.+)", t)
     if m:
-        who = m.group(1)
-        if who in {"tab", "this tab", "current tab", "this", "it", "this window", "current window", "window", "active window", "the window"}:
-            return None
+        full = m.group(1).strip()
+        who = re.sub(r"\s+(?:app|application|window|program)$", "", full).strip()   # 'claude window' -> 'claude'
+        generic = {"tab", "this tab", "current tab", "this", "that", "it", "window", "this window", "current window",
+                   "active window", "the window", "current", "active", "foreground", "front", "current app",
+                   "this app", "active app", "current application", "this one", "that one", "front window"}
+        if full in generic or who in generic or not who:
+            return None                     # 'close the current window' -> the active-window closer in tools.py
         if who in APPS or _match_windows(who):
             return close_app(who)
         return False, f"I don't see {who} open."
@@ -823,6 +827,21 @@ def _single(step: str) -> Optional[Result]:
         return media("next")
     if re.fullmatch(r"(?:previous|play previous|previous song|previous track|go back a song|last song|play the last song)", t):
         return media("previous")
+
+    # while WhatsApp is on screen, a bare "second one" / "open 2nd" / "the third chat" means that chat
+    m = re.fullmatch(rf"(?:open|go to|click|select|show|pick)?(?: the)? ?({_ORD_RE})(?: one)?(?: chat)?", t)
+    if m and (re.match(r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+(?:st|nd|rd|th)|number \d+)$", m.group(1))
+              or t.endswith("chat")):
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            h = u.GetForegroundWindow()
+            buf = ctypes.create_unicode_buffer(u.GetWindowTextLengthW(h) + 1)
+            u.GetWindowTextW(h, buf, len(buf))
+            if "whatsapp" in buf.value.lower():
+                return whatsapp_open_chat(nth=_ord(m.group(1).replace("number ", "")))
+        except Exception:
+            pass
 
     m = re.fullmatch(rf"(?:open|go to|click|select|show)(?: on)?(?: the)? ({_ORD_RE})(?: one)? chat(?: on whatsapp| in whatsapp)?", t)
     if m:

@@ -12,3 +12,5 @@ screen-brightness-control
 google-genai
 sherpa-onnx
 edge-tts
+pycaw; sys_platform == "win32"
+comtypes; sys_platform == "win32"

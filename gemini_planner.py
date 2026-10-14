@@ -52,8 +52,10 @@ SPEC: dict = {
     "close_window": {},
     "open_folder": {"name": (STR, True, None)},
     "open_settings": {"name": (STR, True, None)},
-    "volume": {"op": (ENUM, True, ["up", "down", "mute", "unmute"])},
-    "brightness": {"op": (ENUM, True, ["up", "down"])},
+    "volume": {"op": (ENUM, True, ["up", "down", "mute", "unmute", "set", "max", "min"]),
+               "level": (INT, False, (0, 100)), "amount": (INT, False, (1, 100))},
+    "brightness": {"op": (ENUM, True, ["up", "down", "set", "max", "min"]),
+                   "level": (INT, False, (0, 100)), "amount": (INT, False, (1, 100))},
     "screenshot": {},
     "hotkey": {"name": (ENUM, True, HOTKEYS)},
     "press": {"key": (ENUM, True, KEYS)},
@@ -78,7 +80,7 @@ BROWSER (Chrome, acts on the tab Chief is looking at): new_tab{url?} close_tab g
  type{text, submit?:bool, field?: hint of the box} scroll{direction:up|down|top|bottom} back forward reload zoom{op:in|out|reset}
  media{op:play|pause|toggle|mute|unmute|next|previous|skip_ahead|skip_back|faster|slower|fullscreen, seconds?} (video/music playing in the browser)
  read_page summarize_page
-COMPUTER: open_app{name} close_window open_folder{name} open_settings{name} volume{op:up|down|mute|unmute} brightness{op:up|down} screenshot
+COMPUTER: open_app{name} close_window open_folder{name} open_settings{name} volume{op:up|down|mute|unmute|set|max|min, level?:0-100 exact percent, amount?:percent to change by} brightness{op:up|down|set|max|min, level?, amount?} screenshot
  hotkey{name: copy|paste|cut|select_all|undo|redo|save|find|print|minimize|maximize|switch_window|show_desktop|task_manager|snip|fullscreen|lock}
  press{key: enter|esc|tab|space|backspace|delete|up|down|left|right|home|end|pageup|pagedown} type_text{text} (types into the focused app)
  media_key{op:play_pause|next|previous} (system-wide media keys: Spotify, any player)
@@ -96,7 +98,14 @@ RULES:
   "I'm sad/tired/in a good mood, play something" -> play_youtube with a fitting song search (e.g. "relaxing songs", "happy upbeat songs");
   "where am I / what is this page" -> read_page; "I'm lost / what should I click" -> look.
 - open_app is ONLY for real application names (Notepad, Spotify, Calculator...). Never put page words (link, result, first, video, tab) in it.
+- Exact levels: "volume to 50 percent" -> volume{op:set,level:50}; "brightness max / full" -> brightness{op:max}; "volume half" -> level 50; "lower brightness by 20" -> {op:down,amount:20}.
+- If a request is unclear or could mean two things (which tab? which video? which person?), do NOT guess: ask ONE short, friendly question in "ask".
+- "close the current window" / "close this window" -> close_window. Scroll up/down/top/bottom -> scroll.
+- Ads are skipped automatically by the browser extension, so never add a "skip ad" step after play_youtube.
 EXAMPLES:
+"set the volume to fifty percent" -> {"steps":[{"do":"volume","op":"set","level":50}]}
+"brightness to maximum" -> {"steps":[{"do":"brightness","op":"max"}]}
+"open that one" (nothing clear on screen) -> {"steps":[],"ask":"Which one do you mean, Chief?"}
 "it's too loud" -> {"steps":[{"do":"volume","op":"down"}]}
 "I can't read this, the text is tiny" -> {"steps":[{"do":"zoom","op":"in"}]}
 "I'm feeling sad, play something nice" -> {"steps":[{"do":"play_youtube","query":"soothing feel good songs"}]}

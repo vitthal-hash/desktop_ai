@@ -18,6 +18,8 @@ import time
 from collections import deque
 
 import env_loader  # noqa: F401  (loads GEMINI_API_KEY from .env)
+import friendly
+import levels
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -78,13 +80,14 @@ Rules:
 - If the user explicitly says "in this tab", "current tab", "same tab", "on this page", or "here", use navigate_current_tab for navigation/search rather than opening a new browser tab.
 - For songs/videos to find on YouTube, use youtube_search.
 - For "search the web for X", use web_search and query=X.
-- For volume and brightness, use direction=up/down/mute.
+- For volume and brightness, use direction=up/down/mute/max/min. If the user gives an exact percent (\"volume to 50 percent\"), set \"level\" to that number (0-100) and direction=set.
 - For Windows Settings, use open_settings and target as one of the supported page names.
 - For delete/erase/clear all text in the current document/editor, use delete_active_text. Never map deleting files/folders to this action.
 - For opening a particular Chrome account/profile, use open_profile_picker; do not claim you can pick a numbered account.
 - For ordinary questions, greetings, explanations, or requests for advice, use chat.
 - If a computer action is not in the available action list, use unsupported_action.
 - Output JSON only. Do not include a success message; the program will report what actually happened.
+- If the user gives an exact percent for volume/brightness, add a numeric field \"level\" (0-100) to the JSON object.
 """
 
 
@@ -479,45 +482,68 @@ def _press_key(key: str) -> Result:
 
 
 def _scroll(direction: str) -> Result:
+    """Raw mouse-wheel scroll. NOTE: on Windows pyautogui's scroll() takes wheel units where one notch is 120,
+    so the old pg.scroll(5) moved the page by almost nothing. 600 = five notches, a comfortable page-ish step."""
     pg = _pg()
     if pg is None:
         return False, "Scrolling needs pyautogui installed in VAANI's existing environment."
     try:
-        pg.scroll(5 if direction.lower() == "up" else -5)
-        return True, f"Scrolled {direction} in the active window."
+        pg.scroll(600 if direction.lower() == "up" else -600)
+        return True, friendly.pick("scroll_ok", d=direction.lower())
+    except Exception as exc:
+        return False, f"Scrolling failed: {exc}"
+
+
+def _smart_scroll(direction: str) -> Result:
+    """Scroll for real and only say so when something moved: page scroller first (finds the inner scrolling
+    area that YouTube / Gmail / WhatsApp Web use), then the mouse wheel, then the keyboard."""
+    d = (direction or "down").lower()
+    if d not in {"up", "down", "top", "bottom"}:
+        d = "down"
+    chrome_front = _is_chrome_title(_foreground_title())
+    if chrome_front and _bridge_ready():
+        ok, payload = _bridge_call("scroll", direction=d)
+        moved = payload.get("moved") if isinstance(payload, dict) else None
+        if ok and moved is not False:
+            return True, friendly.pick("scroll_ok", d=("to the " + d) if d in {"top", "bottom"} else d)
+        log.info("extension scroll did not move the page (%s); using the mouse wheel", payload)
+    pg = _pg()
+    if pg is None:
+        return False, "Scrolling needs pyautogui installed."
+    try:
+        if d in {"top", "bottom"}:
+            pg.press("home" if d == "top" else "end")
+            for _ in range(3):
+                pg.scroll(2400 if d == "top" else -2400)
+        else:
+            pg.scroll(600 if d == "up" else -600)
+        return True, friendly.pick("scroll_ok", d=("to the " + d) if d in {"top", "bottom"} else d)
     except Exception as exc:
         return False, f"Scrolling failed: {exc}"
 
 
 def _volume(direction: str) -> Result:
-    pg = _pg()
-    if pg is None:
-        return False, "Volume hotkeys need pyautogui installed in VAANI's existing environment."
-    key = {"up": "volumeup", "down": "volumedown", "mute": "volumemute"}.get(direction.lower())
-    if not key:
-        return False, "Tell me to turn volume up, down, or mute it."
-    try:
-        repeats = 5 if direction.lower() in {"up", "down"} else 1
-        for _ in range(repeats):
-            pg.press(key)
-        return True, "System volume mute toggled." if direction.lower() == "mute" else f"Turned system volume {direction}."
-    except Exception as exc:
-        return False, f"Volume control failed: {exc}"
+    """Mute toggle, or an exact 10% step up/down (use levels.adjust for percentages)."""
+    d = direction.lower()
+    if d in {"mute", "unmute"}:
+        pg = _pg()
+        if pg is None:
+            return False, "Volume hotkeys need pyautogui installed in VAANI's existing environment."
+        try:
+            pg.press("volumemute")
+            return True, "Volume mute toggled."
+        except Exception as exc:
+            return False, f"Volume control failed: {exc}"
+    if d not in {"up", "down"}:
+        return False, "Tell me to turn volume up, down, mute it, or set a percent."
+    return levels.adjust("volume", f"volume {d}")
 
 
 def _brightness(direction: str) -> Result:
-    try:
-        import screen_brightness_control as sbc
-        current = sbc.get_brightness()
-        if isinstance(current, list):
-            current = current[0]
-        value = min(100, int(current) + 10) if direction.lower() == "up" else max(0, int(current) - 10)
-        sbc.set_brightness(value)
-        return True, f"Brightness set to about {value} percent."
-    except ImportError:
-        return False, "Brightness control needs screen-brightness-control installed in VAANI's existing environment."
-    except Exception as exc:
-        return False, f"Direct brightness control isn't available on this display: {exc}"
+    d = direction.lower()
+    if d not in {"up", "down"}:
+        return False, "Tell me to make the screen brighter, dimmer, or set a percent."
+    return levels.adjust("brightness", f"brightness {d}")
 
 
 def _open_folder(target: str) -> Result:
@@ -646,11 +672,18 @@ def _execute(plan: dict[str, Any]) -> Optional[Result]:
     if action == "hotkey":
         return _run_hotkey(key)
     if action == "scroll":
-        return _scroll(direction if direction in {"up", "down"} else "down")
-    if action == "volume":
-        return _volume(direction)
-    if action == "brightness":
-        return _brightness(direction)
+        return _smart_scroll(direction if direction in {"up", "down", "top", "bottom"} else "down")
+    if action in {"volume", "brightness"}:
+        lvl = plan.get("level")
+        try:
+            lvl = int(re.sub(r"[^\d]", "", str(lvl))) if lvl not in (None, "") else None
+        except ValueError:
+            lvl = None
+        if action == "volume" and direction in {"mute", "unmute"}:
+            return _volume("mute")
+        if lvl is not None:
+            return levels.adjust(action, f"{action} to {lvl} percent")
+        return levels.adjust(action, f"{action} {direction or 'up'}")
     if action == "open_settings":
         return _settings(target)
     if action == "current_tab_media":
@@ -764,22 +797,24 @@ def _bridge_result(action: str, **kwargs) -> Result:
 
 
 def _speakable(action: str, payload) -> str:
+    """What gets said out loud: short, human names ('GitHub'), never raw page titles or URLs."""
     p = payload if isinstance(payload, dict) else {}
     if action in {"click_result", "click_link", "click_text", "click_button"}:
         c = p.get("clicked")
         text = c.get("text") if isinstance(c, dict) else c
-        return f"Clicked {str(text)[:90]}." if text else "Clicked it."
+        label = friendly.short_label(text) if text else ""
+        return friendly.pick("click", name=label) if label else friendly.pick("click_plain")
     if action == "switch_tab":
-        return f"Switched to {p.get('title') or 'that tab'}."
+        return friendly.pick("switch_tab", name=friendly.short_name(p.get("title") or "", p.get("url") or ""))
     if action in {"search", "type"}:
-        return f"Typed {p.get('typed', '')[:80]}" + (" and submitted it." if p.get("submitted") else ".")
+        return friendly.pick("typed") + (" And I submitted it." if p.get("submitted") else "")
     if action == "new_tab":
-        return "Opened a new tab."
+        return friendly.pick("new_tab")
     if action == "close_tab":
-        return "Closed the tab."
+        return friendly.pick("close_tab")
     if action == "scroll":
-        return f"Scrolled {p.get('scrolled', '')}."
-    return "Done."
+        return friendly.pick("scroll_ok", d=p.get("scrolled", "down"))
+    return friendly.pick("generic")
 
 
 def _page_snapshot():
@@ -795,10 +830,10 @@ def _page_snapshot():
 
 def _describe_page(state: dict) -> str:
     host = urllib.parse.urlparse(state.get("url", "")).hostname or ""
-    out = f"You're on {state.get('title') or 'an untitled page'}" + (f" at {host}." if host else ".")
+    out = f"You're on {friendly.short_name(state.get('title') or '', state.get('url') or '') if (state.get('title') or host) else 'an untitled page'}."
     res = state.get("results") or []
     if res:
-        out += " The top results are: " + "; ".join(f"{r['index']}. {r['text'][:60]}" for r in res[:4]) + "."
+        out += " The top results are: " + "; ".join(f"{r['index']}. {friendly.short_label(r['text'], 50)}" for r in res[:4]) + "."
     return out
 
 
@@ -959,6 +994,13 @@ def _quick_local(lower: str) -> Optional[Result]:
         return _calculate(m.group(1))
     if re.search(r"\bunmute\b|\bmute\b", lower) and "volume" not in lower.replace("mute", ""):
         return _volume("mute")
+    # exact / relative volume & brightness: "volume to 50 percent", "brightness max", "a bit louder"
+    if re.search(r"\b(?:volume|louder|quieter|sound level)\b", lower) and not re.search(r"\b(?:mute|unmute)\b", lower):
+        if levels.parse_level(lower, 50) is not None:
+            return levels.adjust("volume", lower)
+    if re.search(r"\b(?:brightness|brighter|dimmer|dim the screen)\b", lower):
+        if levels.parse_level(lower, 50) is not None:
+            return levels.adjust("brightness", lower)
     if re.search(r"\bvolume\b|\blouder\b|\bquieter\b", lower):
         if re.search(r"\bmute\b", lower):
             return _volume("mute")
@@ -979,16 +1021,14 @@ def _quick_local(lower: str) -> Optional[Result]:
         return _brightness("up")
     if re.search(r"\b(?:too bright|so bright|hurts my eyes|dimmer|dim the screen)\b", lower):
         return _brightness("down")
-    m = re.fullmatch(r"scroll(?: the page| page)?(?: to)?(?: the)? (up|down|top|bottom)(?: a (?:little|bit))?", lower)
+    m = re.fullmatch(r"(?:scroll|go|move|page)(?: the page| page| the screen| screen)?(?: all the way)?(?: to)?(?: the)? (up|down|top|bottom)"
+                     r"(?: a (?:little|bit|lot))?(?: a little| a bit| more| again)?(?: please)?", lower)
     if m:
-        d = m.group(1)
-        if d in {"top", "bottom"}:
-            pg = _pg()
-            if pg is None:
-                return False, "Scrolling needs pyautogui installed."
-            pg.press("home" if d == "top" else "end")
-            return True, f"Scrolled to the {d}."
-        return _scroll(d)
+        return _smart_scroll(m.group(1))
+    if re.fullmatch(r"(?:scroll|page) ?(up|down)", lower):
+        return _smart_scroll(re.fullmatch(r"(?:scroll|page) ?(up|down)", lower).group(1))
+    if lower in {"scroll", "scroll more", "keep scrolling", "more", "go further down"}:
+        return _smart_scroll("down")
     if lower in {"play", "resume", "play video", "resume video", "play music", "resume music"}:
         return _media_control("play")
     if lower in {"pause", "pause video", "pause music", "stop video", "stop music"}:
@@ -1191,6 +1231,12 @@ def _page_commands(text: str, lower: str) -> Optional[Result]:
         m2 = re.fullmatch(r"zoom (in|out)|(?:make (?:it|the page|the text) )?(bigger|smaller)|reset zoom", lower)
         op = "reset" if lower == "reset zoom" else {"in": "in", "out": "out", "bigger": "in", "smaller": "out"}[m2.group(1) or m2.group(2)]
         return _browser_nav("zoom", op=op)
+    # a bare "second one" / "the 3rd" / "open number 2" while Chrome is in front means the 2nd/3rd result
+    m = re.fullmatch(rf"(?:please )?(?:(?:open|play|click(?: on)?|select|choose|watch|go to|take me to|show(?: me)?|pick|tap)\s+)?(?:the )?{_ORD_RE}"
+                     rf"(?: one| result| video| link| website| site| song| item| option)?(?: please)?", lower)
+    if m and (m.group(1) in _PLAIN_ORDINALS or re.match(r"\d+(?:st|nd|rd|th)$|number \d+$", m.group(1))) \
+            and _bridge_ready() and _is_chrome_title(_foreground_title()):
+        return _click_nth(_parse_ordinal(m.group(1)), "result")
     # "open the second video / play the third result / click the first link"
     m = re.fullmatch(rf"(?:please )?(?:open|play|click(?: on)?|select|choose|watch|go to|show)(?: me)?(?: the)? {_ORD_RE}(?: one)?(?: {_KIND_RE})?", lower)
     if m:
@@ -1353,10 +1399,14 @@ _ASR_FIXES = [
     (r"\b(?:you ?tube|u ?tube)\b", "youtube"), (r"\bg ?mail\b|\bgee mail\b", "gmail"),
     (r"\bwhats ?app\b|\bwhat's app\b|\bwatsapp\b", "whatsapp"), (r"\bchat ?gpt\b|\bchat g p t\b", "chatgpt"),
     (r"\blinked in\b", "linkedin"), (r"\b(?:crome|krome|chrom|chrome's)\b", "chrome"),
-    (r"\b(new|next|previous|last|first|close|this|current|that|another|a|the) (?:tap|tub|tabs|top|tab's)\b", r"\1 tab"),
+    (r"\b(new|next|previous|last|first|close|this|current|that|another|a|the) (?:tap|tub|tabs|tab's)\b", r"\1 tab"),
+    (r"\b(new|close|next|previous|this|current) top\b(?! of)", r"\1 tab"),
     (r"\b(second|third|fourth|fifth|sixth|\d+(?:st|nd|rd|th)?) (?:tap|tub|tabs)\b", r"\1 tab"),
     (r"\bnew tab(?:s)? tab\b", "new tab"), (r"\bwindows? setting\b", "windows settings"),
     (r"\bsong's\b", "songs"),
+    (r"\bgit ?hub\b|\bget hub\b", "github"), (r"\bper ?cent\b|\bpercentage\b", "percent"),
+    (r"\bbright ?ness\b", "brightness"), (r"\bcurrent windows\b", "current window"),
+    (r"\bscrawl\b|\bscroll's\b", "scroll"), (r"\bclaud\b|\bclawed\b|\bcloud (?=window|app)\b", "claude"),
 ]
 _PREFIX = re.compile(
     r"^(?:(?:so|well|um+|uh+|hmm+|please|kindly|just|now|actually|then|and|also|okay|ok|"
@@ -1405,6 +1455,7 @@ def _is_plain_chat(lower: str) -> bool:
 
 
 _brain_notice_at = -1e9
+_pending_ask: Optional[dict] = None          # a clarifying question VAANI just asked
 _recent: deque = deque(maxlen=4)                       # what Chief asked and what happened (for "do that again", "the next one")
 _PAGEISH = re.compile(r"\b(click|link|links|result|results|video|videos|song|songs|music|first|second|third|fourth|fifth|one|button|"
                       r"page|scroll|type|fill|box|field|pause|play|resume|next|previous|skip|mute|unmute|speed|faster|slower|"
@@ -1545,14 +1596,7 @@ def _exec_step(st: dict, ctx: dict) -> Result:
             _press_key("enter")
         return r
     if do == "scroll":
-        d = st.get("direction", "down")
-        if _bridge_ready() and chrome_front:
-            ok, payload = _bridge_call("scroll", direction=d)
-            if ok:
-                return True, f"Scrolled {d}."
-        if d in {"top", "bottom"}:
-            return _press_key("home" if d == "top" else "end")
-        return _scroll(d)
+        return _smart_scroll(st.get("direction", "down"))
     if do == "back":
         return _browser_nav("back")
     if do == "forward":
@@ -1580,10 +1624,17 @@ def _exec_step(st: dict, ctx: dict) -> Result:
         return _open_folder(st["name"])
     if do == "open_settings":
         return _settings(st["name"])
-    if do == "volume":
-        return _volume("mute" if st["op"] in {"mute", "unmute"} else st["op"])
-    if do == "brightness":
-        return _brightness(st["op"])
+    if do in {"volume", "brightness"}:
+        op = st["op"]
+        if do == "volume" and op in {"mute", "unmute"}:
+            return _volume("mute")
+        if op in {"max", "min"}:
+            return levels.adjust(do, f"{do} {op}")
+        if st.get("level") is not None:
+            return levels.adjust(do, f"{do} to {int(st['level'])} percent")
+        if st.get("amount") is not None:
+            return levels.adjust(do, f"{do} {op} by {int(st['amount'])}")
+        return levels.adjust(do, f"{do} {op}")
     if do == "screenshot":
         return _screenshot()
     if do == "hotkey":
@@ -1654,25 +1705,35 @@ def _run_steps(steps: list, ctx: dict) -> Result:
 
 def _brain_route(text: str):
     """-> ("done", result) | ("chat", None) | ("failed", None). 'failed' means: use the offline fallback."""
+    global _pending_ask
     try:
         import gemini_planner as gp
     except Exception as exc:
         log.warning("brain module unavailable: %s", exc)
         return "failed", None
-    if not gp.available():
-        return "failed", None
+    using_gemini = gp.available()
+    planner = gp
+    if not using_gemini:                       # no Gemini key: plan with the local qwen model through Ollama
+        try:
+            import local_brain as planner
+        except Exception as exc:
+            log.warning("local brain unavailable: %s", exc)
+            return "failed", None
+        if not planner.available():
+            return "failed", None
     started = time.monotonic()
     ctx = _gather_context(text)
-    steps, ask, err = gp.plan_steps(text, ctx)
+    steps, ask, err = planner.plan_steps(text, ctx)
     if err:
         log.warning("brain failed for %r: %s", text, err)
         global _brain_notice_at
-        if time.monotonic() - _brain_notice_at > 900:             # at most once every 15 minutes
+        if using_gemini and time.monotonic() - _brain_notice_at > 900:    # at most once every 15 minutes
             _brain_notice_at = time.monotonic()
             _announce("Chief, I can't reach my Gemini brain right now, so I'm using simpler offline mode. Please check the API key.")
         return "failed", None
     if ask and not steps:
         _remember(text, [], f"I asked: {ask}")
+        _pending_ask = {"orig": text, "q": ask, "t": time.monotonic()}      # Chief's next sentence answers this question
         return "done", (True, ask)
     if len(steps) == 1 and steps[0]["do"] == "chat":
         return "chat", None
@@ -1725,8 +1786,8 @@ def _perform_single(orig: str, norm: str | None = None) -> Optional[Result]:
                 log.info("route=%s %r -> %s (%.0f ms)", stage, orig, result, (time.monotonic() - started) * 1000)
                 return result
 
-        if lower in {"close notepad", "close the notepad", "close this window", "close the current window",
-                     "close active window", "close this app", "close the app", "close window"}:
+        if re.fullmatch(r"(?:close|quit|exit|kill)(?: out of)?(?: the| this| that| my)?(?: current| active| front| foreground| open)?"
+                        r"(?: window| app| application| program| one)(?: please| now)?", lower) or lower in {"close notepad", "close the notepad"}:
             return _execute({"action": "close_window"})
         if lower in {"next line", "new line", "go to next line", "move to next line",
                      "take the cursor to the next line", "press enter", "press return"}:
@@ -1793,14 +1854,24 @@ def _style_reply(result: Optional[Result]) -> Optional[Result]:
         return ok, "Sorry, Chief. " + msg
     m = re.search(r"[.!](?=\s)", msg)
     styled = (msg[:m.start()] + ", Chief" + msg[m.start():]) if m else msg.rstrip(".!") + ", Chief."
-    if len(msg) <= 70 and not low.startswith(_INFO_PREFIXES):
-        styled += " " + _CLOSERS[_closer_i % len(_CLOSERS)]
-        _closer_i += 1
+    _closer_i += 1
+    if len(msg) <= 70 and not low.startswith(_INFO_PREFIXES) and _closer_i % 3 == 0:     # not after every single action
+        styled += " " + _CLOSERS[(_closer_i // 3) % len(_CLOSERS)]
     return ok, styled
 
 
 def perform_action(user_text: str) -> Optional[Result]:
+    global _pending_ask
     orig = _fix_asr((user_text or "").strip())
+    if _pending_ask is not None:
+        pend, _pending_ask = _pending_ask, None
+        words = re.findall(r"[a-z0-9']+", orig.lower())
+        if time.monotonic() - pend["t"] < 45 and 0 < len(words) <= 8 and not _looks_like_command(" ".join(words)):
+            # a short answer to the question VAANI just asked -> plan again with both sentences together
+            combined = f'{pend["orig"]} (I asked: "{pend["q"]}" and Chief answered: "{orig}")'
+            status, result = _brain_route(combined)
+            if status == "done":
+                return _style_reply(result)
     norm = _normalize_command(orig)
     steps = _split_steps(norm)
     if len(steps) == 1:

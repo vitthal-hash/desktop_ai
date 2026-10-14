@@ -26,7 +26,20 @@ log = logging.getLogger("vaani.voice")
 
 RATE = int(os.getenv("VAANI_TTS_RATE", "175"))
 VOLUME = max(0.0, min(1.0, float(os.getenv("VAANI_TTS_VOLUME", "1.0"))))
-BACKEND = os.getenv("VAANI_TTS", "auto").strip().lower()      # auto | ps | pyttsx3 | edge
+def _default_backend() -> str:
+    """Natural neural voice (edge) when the package is installed, otherwise the Windows voice."""
+    try:
+        import edge_tts  # noqa: F401
+        return "edge"
+    except Exception:
+        return "auto"
+
+
+BACKEND = (os.getenv("VAANI_TTS", "") or "").strip().lower() or _default_backend()      # auto | ps | pyttsx3 | edge
+if BACKEND not in {"auto", "ps", "pyttsx3", "edge"}:
+    BACKEND = _default_backend()                  # old values like "system" now mean: use the best available voice
+EDGE_RATE = os.getenv("VAANI_EDGE_RATE", "+4%")   # a touch quicker than default sounds more natural
+EDGE_PITCH = os.getenv("VAANI_EDGE_PITCH", "+0Hz")
 VOICE_PREF = os.getenv("VAANI_VOICE", "").strip()
 
 PAUSE_AFTER = {".": 0.38, "!": 0.40, "?": 0.42, ";": 0.25, ":": 0.25, ",": 0.14, "\n": 0.50}
@@ -188,7 +201,11 @@ def _say_edge(chunk: str) -> None:                                        # need
     import edge_tts
     voice = VOICE_PREF if "-" in VOICE_PREF else "en-IN-NeerjaNeural"      # female (Indian English)
     path = os.path.join(tempfile.gettempdir(), f"vaani_tts_{os.getpid()}.mp3")
-    asyncio.run(edge_tts.Communicate(chunk, voice).save(path))
+    try:
+        comm = edge_tts.Communicate(chunk, voice, rate=EDGE_RATE, pitch=EDGE_PITCH)
+    except TypeError:
+        comm = edge_tts.Communicate(chunk, voice)
+    asyncio.run(comm.save(path))
     import ctypes
     mci = ctypes.windll.winmm.mciSendStringW
     mci('close vaani', None, 0, 0)
@@ -210,7 +227,22 @@ def _speak_chunk(chunk: str) -> None:
     _say_pyttsx3(chunk)
 
 
+def _merge_for_edge(chunks: list) -> list:
+    """The neural voice handles its own pauses, so send whole sentences in one go (smoother, less robotic)."""
+    merged, cur = [], ""
+    for chunk, _pause in chunks:
+        if cur and len(cur) + len(chunk) > 450:
+            merged.append((cur, 0.0))
+            cur = ""
+        cur = (cur + " " + chunk).strip()
+    if cur:
+        merged.append((cur, 0.0))
+    return merged
+
+
 def _speak_chunks_one_by_one(chunks: list) -> None:
+    if BACKEND == "edge" and time.time() >= _edge_failed_until:
+        chunks = _merge_for_edge(chunks)
     for chunk, pause in chunks:
         if _stop.is_set():
             break

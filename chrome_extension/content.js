@@ -7,6 +7,60 @@
 
   const clean = v => (v || "").replace(/\s+/g, " ").trim();
 
+  // The element that actually scrolls on this page (the biggest scrollable area under the screen centre / left-centre).
+  function findScroller() {
+    const root = document.scrollingElement || document.documentElement;
+    const canScroll = n => {
+      if (!n || n === document.body || n === document.documentElement) return false;
+      const s = getComputedStyle(n);
+      return /(auto|scroll|overlay)/.test(s.overflowY) && n.scrollHeight > n.clientHeight + 10;
+    };
+    if (root.scrollHeight > root.clientHeight + 10 && !/(hidden)/.test(getComputedStyle(document.body).overflowY)) {
+      return root;                                    // an ordinary page: the page itself scrolls
+    }
+    const pts = [[0.5, 0.5], [0.35, 0.5], [0.65, 0.5], [0.5, 0.3], [0.5, 0.75]];
+    for (const [fx, fy] of pts) {
+      for (let n = document.elementFromPoint(innerWidth * fx, innerHeight * fy); n; n = n.parentElement) {
+        if (canScroll(n)) return n;
+      }
+    }
+    let best = null, bestArea = 0;                    // last resort: the largest scrollable element
+    for (const n of document.querySelectorAll("div, main, section, ul, ol")) {
+      if (!canScroll(n)) continue;
+      const r = n.getBoundingClientRect();
+      const area = r.width * r.height;
+      if (area > bestArea) { best = n; bestArea = area; }
+    }
+    return best || root;
+  }
+
+  // ---- YouTube: skip ads automatically, so Chief never has to say "skip the ad" ----
+  const FAST_FORWARD_UNSKIPPABLE_ADS = true;          // set to false to only ever click "Skip"
+  if (/(^|\.)youtube\.com$/.test(location.hostname)) {
+    let sped = false, prev = { muted: false, rate: 1 };
+    setInterval(() => {
+      try {
+        const player = document.querySelector("#movie_player");
+        const video = document.querySelector("video.html5-main-video") || document.querySelector("video");
+        const adShowing = !!(player && player.classList.contains("ad-showing"));
+        const skip = document.querySelector(
+          ".ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button-container button");
+        if (skip && skip.offsetParent !== null) skip.click();
+        const overlayClose = document.querySelector(".ytp-ad-overlay-close-button");
+        if (overlayClose) overlayClose.click();
+        if (FAST_FORWARD_UNSKIPPABLE_ADS && adShowing && video) {
+          if (!sped) { prev = { muted: video.muted, rate: video.playbackRate || 1 }; sped = true; }
+          video.muted = true;
+          video.playbackRate = 16;
+        } else if (sped && video) {
+          video.muted = prev.muted;
+          video.playbackRate = prev.rate;
+          sped = false;
+        }
+      } catch (e) { /* never break the page */ }
+    }, 400);
+  }
+
   function isVisible(el) {
     if (!el) return false;
     const r = el.getBoundingClientRect();
@@ -214,12 +268,17 @@
       }
 
       case "scroll": {
+        // Many sites (YouTube, Gmail, WhatsApp Web, docs...) scroll inside an inner container, so window.scrollBy
+        // does nothing there. Find the real scrolling area, scroll it instantly, and report whether it MOVED.
         const d = cmd.direction || "down";
-        const amount = Math.round(window.innerHeight * 0.8);
-        if (d === "top") window.scrollTo({ top: 0, behavior: "smooth" });
-        else if (d === "bottom") window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-        else window.scrollBy({ top: d === "up" ? -amount : amount, behavior: "smooth" });
-        return { scrolled: d };
+        const el = findScroller();
+        const before = el.scrollTop;
+        const amount = Math.round((el === document.scrollingElement ? window.innerHeight : el.clientHeight) * 0.8);
+        if (d === "top") el.scrollTo({ top: 0, behavior: "auto" });
+        else if (d === "bottom") el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+        else el.scrollBy({ top: d === "up" ? -amount : amount, behavior: "auto" });
+        const moved = Math.abs(el.scrollTop - before) > 1;
+        return { scrolled: d, moved };
       }
 
       default:
