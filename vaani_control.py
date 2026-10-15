@@ -35,7 +35,7 @@ def request_pause(flag: bool = True) -> None:
     if flag:
         set_status("paused", "Microphone off - use the tray menu to resume the microphone")
     else:
-        set_status("wake", 'Waiting for "Hey Computer"')
+        set_status("wake", f'Waiting for "{__import__("wakeword").display()}"')
     log.info("microphone %s", "paused" if flag else "resumed")
 
 

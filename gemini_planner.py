@@ -31,7 +31,9 @@ KEYS = ["enter", "esc", "tab", "space", "backspace", "delete", "up", "down", "le
 MEDIA_OPS = ["play", "pause", "toggle", "mute", "unmute", "next", "previous", "skip_ahead", "skip_back", "faster", "slower", "fullscreen"]
 
 # action -> {arg: (kind, required, extra)}
-STR, INT, ENUM, BOOL, URL = "str", "int", "enum", "bool", "url"
+STR, INT, ENUM, BOOL, URL, OBJ = "str", "int", "enum", "bool", "url", "obj"
+WINDOW_OPS = ["snap_left", "snap_right", "snap_top", "snap_bottom", "maximize", "restore", "minimize", "show_desktop",
+              "next_monitor", "prev_monitor", "next_desktop", "prev_desktop", "new_desktop", "task_view"]
 SPEC: dict = {
     "new_tab": {"url": (URL, False, None)},
     "close_tab": {}, "back": {}, "forward": {}, "reload": {}, "read_page": {}, "summarize_page": {},
@@ -64,6 +66,9 @@ SPEC: dict = {
     "look": {"question": (STR, False, None)},
     "screen_click": {"target": (STR, True, None), "kind": (ENUM, False, ["click", "double", "right"])},
     "screen_task": {"goal": (STR, True, None)},
+    "window": {"op": (ENUM, True, WINDOW_OPS)},
+    "timer": {"seconds": (INT, True, (1, 86400)), "text": (STR, False, None)},
+    "mcp": {"server": (STR, True, None), "tool": (STR, True, None), "args": (OBJ, False, None)},
     "time": {}, "date": {},
     "calc": {"expression": (STR, True, None)},
     "send_whatsapp": {"contact": (STR, True, None), "message": (STR, True, None)},
@@ -84,8 +89,9 @@ COMPUTER: open_app{name} close_window open_folder{name} open_settings{name} volu
  hotkey{name: copy|paste|cut|select_all|undo|redo|save|find|print|minimize|maximize|switch_window|show_desktop|task_manager|snip|fullscreen|lock}
  press{key: enter|esc|tab|space|backspace|delete|up|down|left|right|home|end|pageup|pagedown} type_text{text} (types into the focused app)
  media_key{op:play_pause|next|previous} (system-wide media keys: Spotify, any player)
-SCREEN (VAANI looks at a screenshot): look{question} screen_click{target, kind?:click|double|right} screen_task{goal} (multi-step job in any app/popup/installer)
-OTHER: time date calc{expression} send_whatsapp{contact,message}
+SCREEN (VAANI reads the REAL controls on screen and checks every click worked): look{question} screen_click{target, kind?:click|double|right} screen_task{goal} (multi-step job in any app/popup/installer)
+WINDOWS: window{op:snap_left|snap_right|snap_top|snap_bottom|maximize|restore|minimize|show_desktop|next_monitor|prev_monitor|next_desktop|prev_desktop|new_desktop|task_view}
+OTHER: time date calc{expression} send_whatsapp{contact,message} timer{seconds, text?} (countdown / reminder)
 RULES:
 - "play / put on <song, artist, video>" -> play_youtube (query = clean search text, e.g. "Believer Imagine Dragons"). "search X" -> search_web, unless Chief says YouTube or context.browser.url is YouTube -> search_youtube.
 - "this / that / it / here / the one" refer to what is on screen: use context.window, context.browser, context.page, context.recent.
@@ -101,6 +107,7 @@ RULES:
 - Exact levels: "volume to 50 percent" -> volume{op:set,level:50}; "brightness max / full" -> brightness{op:max}; "volume half" -> level 50; "lower brightness by 20" -> {op:down,amount:20}.
 - If a request is unclear or could mean two things (which tab? which video? which person?), do NOT guess: ask ONE short, friendly question in "ask".
 - "close the current window" / "close this window" -> close_window. Scroll up/down/top/bottom -> scroll.
+- context.memory holds facts Chief told VAANI to remember (favourite song, name...) and his habits: use it for "my favourite", "the usual".
 - Ads are skipped automatically by the browser extension, so never add a "skip ad" step after play_youtube.
 EXAMPLES:
 "set the volume to fifty percent" -> {"steps":[{"do":"volume","op":"set","level":50}]}
@@ -146,7 +153,24 @@ def _coerce(kind: str, extra: Any, value: Any):
     if kind == URL:
         v = str(value).strip()
         return v if re.match(r"^https?://[^\s]+$", v, re.I) else None
+    if kind == OBJ:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return None
+        return value if isinstance(value, dict) and len(json.dumps(value)) < 2000 else None
     return None
+
+
+def full_prompt() -> str:
+    """The planner prompt plus (when configured and connected) the list of outside MCP tools it may use."""
+    try:
+        import mcp_client
+        extra = mcp_client.prompt_section()
+    except Exception:
+        extra = ""
+    return PROMPT.replace("CONTEXT (JSON):", extra + "\nCONTEXT (JSON):") if extra else PROMPT
 
 
 def validate_steps(raw: Any) -> tuple:
@@ -172,6 +196,13 @@ def validate_steps(raw: Any) -> tuple:
             return [], "Brain's open_site had no target."
         if name == "goto_tab" and not (clean.get("to") or clean.get("index")):
             return [], "Brain's goto_tab had no target."
+        if name == "mcp":
+            try:
+                import mcp_client
+                if not mcp_client.is_allowed(clean["server"], clean["tool"]):
+                    return [], f"Brain chose a tool that isn't allowed: {clean['server']}.{clean['tool']}."
+            except Exception:
+                return [], "Brain asked for an outside tool, but none are set up."
         steps.append(clean)
     if any(s["do"] == "chat" for s in steps):
         steps = [{"do": "chat"}] if len(steps) == 1 else [s for s in steps if s["do"] != "chat"]
@@ -237,7 +268,7 @@ def plan_steps(user_text: str, context: dict | None = None) -> tuple:
         return [], "", "GEMINI_API_KEY isn't set (put it in the .env file next to main.py)."
     started = time.monotonic()
     try:
-        raw = _generate(PROMPT + json.dumps(context or {}, ensure_ascii=False) + '\nChief said: "' + user_text.replace('"', "'") + '"')
+        raw = _generate(full_prompt() + json.dumps(context or {}, ensure_ascii=False) + '\nChief said: "' + user_text.replace('"', "'") + '"')
     except ImportError:
         return [], "", "The google-genai package isn't installed (pip install google-genai)."
     except Exception as exc:

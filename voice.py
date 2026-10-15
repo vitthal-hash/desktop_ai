@@ -36,7 +36,7 @@ def _default_backend() -> str:
 
 
 BACKEND = (os.getenv("VAANI_TTS", "") or "").strip().lower() or _default_backend()      # auto | ps | pyttsx3 | edge
-if BACKEND not in {"auto", "ps", "pyttsx3", "edge"}:
+if BACKEND not in {"auto", "ps", "pyttsx3", "edge", "kokoro"}:
     BACKEND = _default_backend()                  # old values like "system" now mean: use the best available voice
 EDGE_RATE = os.getenv("VAANI_EDGE_RATE", "+4%")   # a touch quicker than default sounds more natural
 EDGE_PITCH = os.getenv("VAANI_EDGE_PITCH", "+0Hz")
@@ -240,6 +240,39 @@ def _merge_for_edge(chunks: list) -> list:
     return merged
 
 
+_kokoro = None
+_last = {"text": "", "t": 0.0}
+
+
+def last_spoken() -> tuple:
+    """(text VAANI last said, time.monotonic() when it finished/started) - used to ignore its own echo."""
+    return _last["text"], _last["t"]
+
+
+def _speak_kokoro(chunks: list) -> None:
+    """Offline neural voice (pip install kokoro soundfile; needs espeak-ng for some words). Interruptible."""
+    global _kokoro
+    import numpy as np
+    import sounddevice as sd
+    if _kokoro is None:
+        from kokoro import KPipeline
+        _kokoro = KPipeline(lang_code=os.getenv("VAANI_KOKORO_LANG", "a"))
+    voice = os.getenv("VAANI_KOKORO_VOICE", "af_heart")
+    speed = float(os.getenv("VAANI_KOKORO_SPEED", "1.0"))
+    for chunk, _pause in chunks:
+        if _stop.is_set():
+            return
+        for _gs, _ps, audio in _kokoro(chunk, voice=voice, speed=speed):
+            if _stop.is_set():
+                return
+            sd.play(np.asarray(audio, dtype="float32"), 24000)
+            while sd.get_stream().active and not _stop.is_set():
+                time.sleep(0.03)
+            if _stop.is_set():
+                sd.stop()
+                return
+
+
 def _speak_chunks_one_by_one(chunks: list) -> None:
     if BACKEND == "edge" and time.time() >= _edge_failed_until:
         chunks = _merge_for_edge(chunks)
@@ -253,10 +286,12 @@ def _speak_chunks_one_by_one(chunks: list) -> None:
 
 # ----------------------------------------------------------------- public API
 def speak(text: str) -> None:
+    global BACKEND
     clean = clean_for_speech(text)
     if not clean:
         return
     chunks = split_chunks(clean)
+    _last["text"], _last["t"] = clean, time.monotonic()          # set early too: the echo starts while we are still talking
     with _lock:
         _stop.clear()
         log.info("speaking (%s): %s", BACKEND, clean[:120].replace("\n", " "))
@@ -270,16 +305,29 @@ def speak(text: str) -> None:
                         raise
                     log.info("falling back to pyttsx3")
                     _speak_chunks_one_by_one(chunks)
+            elif BACKEND == "kokoro":
+                try:
+                    _speak_kokoro(chunks)
+                except Exception as exc:
+                    log.error("Kokoro voice failed (%s: %s); switching to the normal voice", type(exc).__name__, str(exc)[:120])
+                    BACKEND = _default_backend()
+                    _speak_chunks_one_by_one(chunks)
             else:
                 _speak_chunks_one_by_one(chunks)
         except Exception:
             log.exception("SPEECH FAILED - nothing was said")
             raise
+        _last["text"], _last["t"] = clean, time.monotonic()
         time.sleep(0.2)                                                    # let the speaker tail die before the mic opens
 
 
 def stop_speaking() -> None:
     _stop.set()
+    try:
+        import sounddevice as sd
+        sd.stop()
+    except Exception:
+        pass
     try:
         if _proc is not None:
             _proc.terminate()

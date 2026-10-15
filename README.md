@@ -3,7 +3,7 @@
 This bundle aligns the app, control module, tray module, action layer, speech modules, browser bridge, and Chrome extension into one source set. It uses a **normal Windows notification-area microphone icon**, not a floating orb; status colors are steady and do not pulse.
 
 ## Included behavior
-- Wake phrase: **“Hey Computer”**. The local Faster-Whisper model handles wake/command transcription.
+- Wake phrase: **“Hey Jarvis”** or **“Hey Vaani”** (change with `VAANI_WAKE_WORDS` in `.env`). The local Faster-Whisper model handles wake/command transcription.
 - Local conversation: Ollama model `llama3.2:3b`.
 - Windows actions and browser actions through the Python action layer.
 - Optional Gemini planning/vision features when `GEMINI_API_KEY` is configured.
@@ -41,7 +41,7 @@ Python files were syntax-compiled and module references were checked for consist
 ## Smoke test (one at a time)
 1. Start VAANI and confirm the tray mic icon appears.
 2. Right-click it → **Show status**; pause then resume microphone.
-3. Say “Hey Computer”, then ask a simple question.
+3. Say “Hey Jarvis”, then ask a simple question.
 4. Try `calculate 2 plus 2`.
 5. In Chrome, test `open a new tab`, then `search YouTube for Python tutorials`. Confirm the current clipboard contents remain unchanged.
 6. If a browser command fails, check `%LOCALAPPDATA%\VAANI\vaani.log` and the extension's service-worker console before repeating it.

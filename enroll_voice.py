@@ -9,6 +9,7 @@ import sys
 import numpy as np
 
 import speaker_lock as sl
+import wakeword
 
 PHRASES = [
     "Hey Computer.",
@@ -20,6 +21,7 @@ PHRASES = [
     "Hey Computer, volume up.",
     "Select the third profile.",
 ]
+PHRASES = [p.replace("Hey Computer", wakeword.display()) for p in PHRASES]
 
 
 def record(prompt: str):
@@ -37,10 +39,10 @@ def test():
         print("No voiceprint yet. Run: python enroll_voice.py")
         return
     print(f"Current threshold: {sl.threshold():.2f}   (match scores at or above it are accepted)")
-    print("Say 'Hey Computer, open Chrome' 3 times yourself, then ask a friend to say it 3 times.")
+    print("Say '" + wakeword.display() + ", open Chrome' 3 times yourself, then ask a friend to say it 3 times.")
     for who in ("YOU", "YOU", "YOU", "FRIEND", "FRIEND", "FRIEND"):
         input(f"\n[{who}] press Enter, then speak: ")
-        audio = record("Hey Computer, open Chrome")
+        audio = record(wakeword.display() + ", open Chrome")
         sc, secs = sl.score(audio)
         print(f"  {who}: score {sc:.2f}  ({secs:.1f}s of speech)  ->  {'ACCEPTED' if sc >= sl.threshold() else 'rejected'}")
     print("\nIf YOU are rejected: lower VAANI_VOICE_THRESHOLD (e.g. setx VAANI_VOICE_THRESHOLD 0.35) or re-enroll.")

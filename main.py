@@ -1,8 +1,10 @@
 """VAANI hands-free assistant with a Windows system-tray control icon."""
 from __future__ import annotations
 
+import contextlib
 import datetime
 import os
+import re
 import sys
 import threading
 import time
@@ -11,6 +13,14 @@ from pathlib import Path
 import pc_control
 import friendly
 import memory
+import features
+import interrupt
+import longmem
+import barge
+import timers
+import mcp_client
+import tools
+import wakeword
 
 import ollama
 from tools import perform_action
@@ -25,7 +35,7 @@ from vaani_control import (
 from tray_status import start_tray, stop_tray
 
 MODEL = os.getenv("VAANI_MODEL", "qwen2.5:3b-instruct")
-WAKE_PHRASE = "Hey Computer"
+WAKE_PHRASE = wakeword.display()
 SESSION_IDLE_TIMEOUT_SECONDS = 30
 # These end the multi-command session but retain wake-word detection.
 SLEEP_PHRASES = {
@@ -84,7 +94,52 @@ def answer_question(user_text: str, mood: str | None = None) -> str:
         return "Chief, I couldn't connect to Ollama. Check that Ollama is running and " + MODEL + " is installed."
 
 
+def _fix_contractions(text: str) -> str:
+    """Speech splits "what's" into "what s": put it back so every pattern matches."""
+    return re.sub(r"\b(what|who|where|how|that|here|there|it|let|when|why) s\b", r"\1's", text, flags=re.I)
+
+
+def _run_one(cmd: str):
+    """Run ONE ordinary command (used by routines). Same path as a spoken command, minus the new feature router."""
+    r = pc_control.handle(cmd)
+    if r is None:
+        r = perform_action(cmd)
+        r = pc_control.rescue(cmd, r)
+    return r or (False, "I didn't know how to do that.")
+
+
+# failures that are NOT worth handing to the screen agent (missing packages, questions, confirmations...)
+_NO_ESCALATE = re.compile(r"\b(confirm|cancel|install|installed|paused|api key|not configured|isn't available|isn't allowed|"
+                          r"say |tell me|which |what should|should i|how long|when should|more or less|up or down|are you sure)\b", re.I)
+
+
+def _should_escalate(text: str, detail: str) -> bool:
+    if os.getenv("VAANI_AUTO_AGENT", "1").strip().lower() in {"0", "off", "false", "no"}:
+        return False
+    if interrupt.cancelled() or _NO_ESCALATE.search(detail or ""):
+        return False
+    t = text.strip().lower()
+    if t.endswith("?") or len(t.split()) > 16 or not tools._looks_like_command(t):
+        return False
+    return True
+
+
+def _escalate(text: str):
+    """The quick routes failed: look at the real screen and do it step by step, checking each step."""
+    logging.info("AUTO-ESCALATE to the screen agent: %s", text)
+    try:
+        tools._announce("That didn't work the quick way, Chief. Let me look at the screen.")
+    except Exception:
+        pass
+    try:
+        return pc_control.agent(text)
+    except Exception as exc:
+        logging.exception("agent escalation failed")
+        return False, f"I couldn't do that even by looking at the screen: {str(exc)[:80]}"
+
+
 def handle_request(user_text: str) -> str:
+    user_text = _fix_contractions(user_text)
     mood = friendly.detect_mood(user_text)
     if mood:
         logging.info("MOOD: %s", mood)
@@ -100,17 +155,32 @@ def handle_request(user_text: str) -> str:
             return value
         logging.info("FOLLOWUP: %r understood as %r", user_text, value)
         user_text = value
-    result = pc_control.handle(user_text)              # NEW: apps, media, WhatsApp, UIA clicks, multi-step
+    try:                                               # "play my favourite song" -> the song it remembered
+        remembered = longmem.rewrite(user_text)
+        if remembered:
+            logging.info("REMEMBERED: %r -> %r", user_text, remembered)
+            user_text = remembered
+    except Exception:
+        logging.exception("longmem.rewrite failed")
+
+    result = features.handle(user_text, _run_one)      # dictation, memory, timers, routines, windows, system info
     if result is None:
-        result = perform_action(user_text)             # your existing router (unchanged)
-        result = pc_control.rescue(user_text, result)  # NEW: screen agent if router says "unsupported"
+        result = pc_control.handle(user_text)          # apps, media, WhatsApp, UIA clicks, multi-step
+    if result is None:
+        result = perform_action(user_text)             # the action router (regex + AI brain)
+        result = pc_control.rescue(user_text, result)  # screen agent if the router says "unsupported"
+    if result is not None and not result[0] and not features.dictating() and _should_escalate(user_text, result[1]):
+        result = _escalate(user_text) or result        # automatic second attempt by looking at the screen
     if result is not None:
         success, detail = result
+        if detail == "" and success:                   # silent success (dictation)
+            return ""
         messages.append({"role": "user", "content": user_text})
         messages.append({"role": "assistant", "content": detail})
         logging.info("ACTION %s: %s => %s", "OK" if success else "FAILED", user_text, detail)
         try:
             memory.note(user_text, success, detail)
+            longmem.note_command(user_text, success)
         except Exception:
             logging.exception("memory.note failed")
         if mood and success and mood != "happy":
@@ -119,14 +189,12 @@ def handle_request(user_text: str) -> str:
     return answer_question(user_text, mood)
 
 
-
 def _normalized(text: str) -> str:
     return " ".join(text.lower().split()).strip(" .!?\t\r\n")
 
 
 def _strip_wake_prefix(text: str) -> str:
-    import re
-    return re.sub(r"^\s*hey[\s,.-]+computer[\s,.:;-]*", "", text, flags=re.I).strip()
+    return wakeword.strip_prefix(text)
 
 
 def greeting() -> str:
@@ -154,11 +222,44 @@ def _warm_up_ollama() -> None:
     threading.Thread(target=run, daemon=True, name="VAANI-OllamaWarmup").start()
 
 
+_speak_lock = threading.Lock()
+
+
 def _say(text: str):
+    """Speak (never two voices at once). While a longer reply plays, saying "stop" interrupts it."""
+    if not (text or "").strip():
+        return
     try:
-        speak(text)
+        with _speak_lock:
+            ctx = barge.watching() if len(text) >= 50 else contextlib.nullcontext()
+            with ctx:
+                speak(text)
     except Exception:
         logging.exception("Speech output failed")
+
+
+def _maybe_confirm(command: str):
+    """When the speech recogniser was unsure, double-check before acting (always for risky commands)."""
+    conf = voice_input.last_confidence
+    if conf is None or features.dictating() or len(command.split()) < 2:
+        return command
+    risky = bool(re.search(r"\b(delete|remove|erase|format|send|shut ?down|restart|close|uninstall|pay|buy|order|submit|sign out|log out)\b", command, re.I))
+    threshold = float(os.getenv("VAANI_CONFIRM_LOGPROB_RISKY", "-0.8")) if risky else float(os.getenv("VAANI_CONFIRM_LOGPROB", "-1.4"))
+    if conf >= threshold:
+        return command
+    logging.info("low speech confidence %.2f for %r: asking to confirm", conf, command)
+    _say(f"Did you say, {command}?")
+    try:
+        answer = listen_once(auto_stop=True, max_wait_seconds=6)
+    except (TimeoutError, ListeningPaused):
+        return None
+    a = _normalized(answer or "")
+    if re.match(r"^(yes|yeah|yep|yup|correct|right|sure|do it|go ahead|haan|ha|ok|okay)\b", a):
+        return command
+    if re.match(r"^(no|nope|nah|wrong|cancel|nahi)\b", a):
+        _say("Sorry, Chief. Say it again?")
+        return None
+    return (answer or "").strip() or None                  # they simply said the right thing instead
 
 
 def process_one_request(user_text: str) -> str:
@@ -166,15 +267,20 @@ def process_one_request(user_text: str) -> str:
     if not user_text:
         return ""
     logging.info("HEARD: %s", user_text)
+    if interrupt.is_stop_phrase(user_text):
+        interrupt.cancel("said stop")
+        return ""
+    interrupt.reset()                                       # a new command clears an old Stop
     set_status("processing", "Understanding your command")
     try:
         reply = handle_request(user_text)
     except Exception:
         logging.exception("handle_request crashed")
         reply = "Sorry, Chief, something went wrong with that one. Please try again."
-    print(f"\nVAANI: {reply}\n", flush=True)
-    set_status("speaking", "Speaking a response")
-    _say(reply)
+    if reply:
+        print(f"\nVAANI: {reply}\n", flush=True)
+        set_status("speaking", "Speaking a response")
+        _say(reply)
     return reply
 
 
@@ -189,7 +295,7 @@ def run_command_session(first_command: str | None = None) -> None:
                 _say("Microphone paused, Chief. Click the VAANI microphone icon in the Windows notification area when you want me back.")
                 return
             if _normalized(command) in SLEEP_PHRASES:
-                _say("I'll return to wake-word mode, Chief. Say Hey Computer when you need me.")
+                _say(f"I'll return to wake-word mode, Chief. Say {WAKE_PHRASE} when you need me.")
                 return
             process_one_request(command)
     while not shutdown_event().is_set() and not is_paused():
@@ -222,10 +328,12 @@ def run_command_session(first_command: str | None = None) -> None:
             return
         if normalized in SLEEP_PHRASES:
             set_status("speaking", "Returning to wake-word mode")
-            _say("Returning to wake-word mode, Chief. Say Hey Computer when you need me.")
+            _say(f"Returning to wake-word mode, Chief. Say {WAKE_PHRASE} when you need me.")
             logging.info("Command session ended by spoken stop/sleep command")
             return
-        process_one_request(command)
+        command = _maybe_confirm(command)
+        if command:
+            process_one_request(command)
 
 
 def _wait_while_paused():
@@ -234,7 +342,7 @@ def _wait_while_paused():
     while is_paused() and not shutdown_event().is_set():
         time.sleep(0.25)
     if not shutdown_event().is_set():
-        set_status("wake", 'Waiting for "Hey Computer"')
+        set_status("wake", f'Waiting for "{WAKE_PHRASE}"')
 
 
 def run_wake_mode() -> None:
@@ -247,6 +355,10 @@ def run_wake_mode() -> None:
         logging.exception("Browser bridge failed to start")
         print("[VAANI] Browser bridge could not start; browser control may be unavailable.", flush=True)
     start_power_watch()
+    if interrupt.start_hotkey():
+        print(f"[VAANI] Stop hotkey ready: {os.getenv('VAANI_STOP_HOTKEY', 'ctrl+alt+x')} cancels whatever I'm doing.", flush=True)
+    timers.start(lambda msg: _say(msg))
+    mcp_client.start_background()
     print("\n[VAANI] Hands-free mode is running.", flush=True)
     print(f'Say "{WAKE_PHRASE}" to start. Say "stop listening" to go back to waiting; use the VAANI tray menu to pause or resume the microphone.', flush=True)
     logging.info("VAANI hands-free service started")
@@ -263,7 +375,7 @@ def run_wake_mode() -> None:
                 set_status("speaking", "Welcome back")
                 _say("Welcome back, Chief. I'm listening.")
             try:
-                set_status("wake", 'Listening for "Hey Computer"')
+                set_status("wake", f'Listening for "{WAKE_PHRASE}"')
                 detected = wait_for_wake_word()
                 failures = 0
             except ListeningPaused:

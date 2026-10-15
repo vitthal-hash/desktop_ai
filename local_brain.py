@@ -33,7 +33,7 @@ def available() -> bool:
 
 
 def _split_prompt() -> tuple:
-    head = gp.PROMPT.split(_SPLIT_AT)[0].rstrip()
+    head = gp.full_prompt().split(_SPLIT_AT)[0].rstrip()
     return head + "\nAnswer with the JSON object only, nothing else."
 
 

@@ -58,3 +58,21 @@ def apply(text: str) -> str:
         if match and (low.isalpha() and (not re.search(r"[aeiou]", low) or len(low) <= 5)):   # acronym-like, not a normal word
             out = re.sub(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])", aliases[match[0]], out)
     return out
+
+
+def add_alias(heard: str, meant: str) -> None:
+    """Teach VAANI: whenever speech-to-text produces `heard`, it means `meant`. Saved into vocab.json."""
+    heard = re.sub(r"\s+", " ", str(heard).lower()).strip(" .,!?")
+    meant = re.sub(r"\s+", " ", str(meant)).strip(" .,!?")
+    if not heard or not meant:
+        return
+    try:
+        data = json.loads(_PATH.read_text(encoding="utf-8")) if _PATH.exists() else {}
+    except Exception:
+        data = {}
+    data.setdefault("aliases", {})[heard] = meant
+    words = data.setdefault("words", [])
+    if meant not in words:
+        words.append(meant)
+    _PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _cache["mtime"] = None                      # force reload on next use

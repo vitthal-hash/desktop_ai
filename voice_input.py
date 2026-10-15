@@ -7,6 +7,7 @@ Use VAANI_STT_MODEL=small (multilingual) if you speak Hindi or other languages t
 """
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import queue
@@ -181,8 +182,52 @@ def _prepare(audio: np.ndarray) -> np.ndarray:
     return np.clip(a, -1.0, 1.0).astype(np.float32)
 
 
+last_confidence = None            # average Whisper log-probability of the last transcription (closer to 0 = surer)
+_parakeet = None
+
+
+def _parakeet_recognizer():
+    """Optional NVIDIA Parakeet through sherpa-onnx (English/European only). Set VAANI_PARAKEET_DIR to the model folder
+    (encoder.int8.onnx, decoder.int8.onnx, joiner.int8.onnx, tokens.txt) and VAANI_STT_BACKEND=parakeet."""
+    global _parakeet
+    d = os.getenv("VAANI_PARAKEET_DIR", "").strip()
+    if not d or os.getenv("VAANI_STT_BACKEND", "").strip().lower() != "parakeet":
+        return None
+    if _parakeet is None:
+        import sherpa_onnx
+        from pathlib import Path
+        base = Path(d)
+
+        def pick(*names):
+            return str(next(base / n for n in names if (base / n).exists()))
+        _parakeet = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=pick("encoder.int8.onnx", "encoder.onnx"), decoder=pick("decoder.int8.onnx", "decoder.onnx"),
+            joiner=pick("joiner.int8.onnx", "joiner.onnx"), tokens=str(base / "tokens.txt"), num_threads=4,
+            model_type="nemo_transducer")
+        log.info("Parakeet speech recogniser loaded from %s", d)
+    return _parakeet
+
+
+def _transcribe_parakeet(audio_16k: np.ndarray) -> str:
+    rec = _parakeet_recognizer()
+    stream = rec.create_stream()
+    stream.accept_waveform(16000, _prepare(audio_16k))
+    rec.decode_stream(stream)
+    return (stream.result.text or "").strip()
+
+
 def transcribe(model, audio_16k: np.ndarray, fast: bool = True, english: bool = True) -> str:
     """fast=True (wake word): quickest decode. fast=False (commands): beam search + vocabulary prompt for clean words."""
+    global last_confidence
+    if not fast and english:
+        try:
+            if _parakeet_recognizer() is not None:
+                text = _transcribe_parakeet(audio_16k)
+                last_confidence = None
+                if text:
+                    return text
+        except Exception as exc:
+            log.warning("Parakeet failed (%s: %s); using Whisper", type(exc).__name__, str(exc)[:120])
     kwargs = dict(language="en" if english else None, condition_on_previous_text=False,
                   no_speech_threshold=0.6, compression_ratio_threshold=2.4, vad_filter=True,
                   vad_parameters=dict(threshold=0.35, min_silence_duration_ms=600, speech_pad_ms=400))
@@ -201,12 +246,36 @@ def transcribe(model, audio_16k: np.ndarray, fast: bool = True, english: bool = 
                                            hotwords=hints or None, **kwargs)
         except TypeError:
             segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, initial_prompt=prompt, **kwargs)
-    text = " ".join(s.text.strip() for s in segments).strip()
+    segs = list(segments)
+    lp = [s.avg_logprob for s in segs if getattr(s, "avg_logprob", None) is not None]
+    last_confidence = (sum(lp) / len(lp)) if lp else None
+    text = " ".join(s.text.strip() for s in segs).strip()
     if text.lower().strip(" .!?,") in HALLUCINATIONS:
         return ""
     if not fast and PROMPT and text.strip().lower() in PROMPT.lower() and len(text.split()) > 6:
         return ""                                   # Whisper sometimes just echoes its own prompt on silence
     return text
+
+
+def _norm_words(t: str) -> str:
+    return " ".join("".join(c if c.isalnum() or c == " " else " " for c in (t or "").lower()).split())
+
+
+def is_echo(text: str) -> bool:
+    """True when `text` is just VAANI's own voice coming back through the microphone."""
+    try:
+        import voice
+        spoken, when = voice.last_spoken()
+    except Exception:
+        return False
+    if not spoken or time.monotonic() - when > 12:
+        return False
+    a, b = _norm_words(text), _norm_words(spoken)
+    if len(a.split()) < 3 or not b:
+        return False
+    if a in b:
+        return True
+    return difflib.SequenceMatcher(None, a, b[: len(a) + 60]).ratio() > 0.8
 
 
 def _unfinished(text: str) -> bool:
@@ -279,6 +348,9 @@ def listen_once(auto_stop: bool = False, max_wait_seconds=None):
         text = fixed
     except Exception:
         pass
+    if is_echo(text):
+        log.info("ignored my own voice: %r", text[:80])
+        return None
     print(f"[VAANI recognised] {text}", flush=True)
     return text
 

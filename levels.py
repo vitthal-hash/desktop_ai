@@ -33,6 +33,7 @@ def words_to_number(text: str) -> str:
     t = re.sub(r"\b(" + "|".join(_UNITS) + r")\b(?=\s*(?:%|percent|per cent)|\s*$)", lambda m: str(_UNITS[m.group(1)]), t)
     t = re.sub(r"\b(?<=to )(" + "|".join(_UNITS) + r")\b", lambda m: str(_UNITS[m.group(1)]), t)
     t = re.sub(r"\b(?<=by )(" + "|".join(_UNITS) + r")\b", lambda m: str(_UNITS[m.group(1)]), t)
+    t = re.sub(r"\b(" + "|".join(_UNITS) + r")\b(?=\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?)\b)", lambda m: str(_UNITS[m.group(1)]), t)
     return t
 
 
@@ -89,7 +90,6 @@ _assumed_volume = 50        # only used when pycaw is missing (we cannot read th
 
 
 def get_volume() -> int:
-    global _assumed_volume
     if sys.platform.startswith("win"):
         try:
             return _clamp(_endpoint().GetMasterVolumeLevelScalar() * 100)
@@ -123,6 +123,26 @@ def set_volume(pct: int) -> bool:
         for _ in range(round(pct / 2)):
             pg.press("volumeup")
         _assumed_volume = pct
+        return True
+    except Exception:
+        return False
+
+
+def _volume_by_keys(pct: int) -> None:
+    import pyautogui as pg
+    pg.PAUSE = 0
+    for _ in range(50):
+        pg.press("volumedown")
+    for _ in range(round(_clamp(pct) / 2)):
+        pg.press("volumeup")
+
+
+def _can_read_back(kind: str) -> bool:
+    """False when the level is only assumed (no pycaw), so read-back would prove nothing."""
+    if kind == "brightness":
+        return True
+    try:
+        _endpoint().GetMasterVolumeLevelScalar()
         return True
     except Exception:
         return False
@@ -170,6 +190,24 @@ def adjust(kind: str, text: str):
         return False, f"I couldn't change the {kind}: {exc}"
     if not ok:
         return False, f"I couldn't change the {kind}."
+    # PROVE it: read the level back; if it didn't take, retry once the slow way
+    try:
+        import time
+        time.sleep(0.15)
+        actual = get_volume() if kind == "volume" else get_brightness()
+        if abs(actual - target) > 4 and _can_read_back(kind):
+            if kind == "volume":
+                _volume_by_keys(target)
+            else:
+                import screen_brightness_control as sbc
+                sbc.set_brightness(target)
+            time.sleep(0.3)
+            actual = get_volume() if kind == "volume" else get_brightness()
+            if abs(actual - target) > 6:
+                return False, f"I tried to set the {kind} to {target} percent, but it's still at {actual}."
+            target = actual
+    except Exception as exc:
+        log.info("read-back skipped: %s", exc)
     if target == 100:
         return True, f"{kind.capitalize()} is at maximum."
     if target == 0:

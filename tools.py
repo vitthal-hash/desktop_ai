@@ -20,6 +20,8 @@ from collections import deque
 import env_loader  # noqa: F401  (loads GEMINI_API_KEY from .env)
 import friendly
 import levels
+import verify
+import screen_state
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -494,32 +496,111 @@ def _scroll(direction: str) -> Result:
         return False, f"Scrolling failed: {exc}"
 
 
+def _close_active_window() -> Result:
+    """Close the active window and PROVE it closed. Tries Alt+F4, then WM_CLOSE, then the title-bar Close button."""
+    pg = _pg()
+    if pg is None:
+        return False, "Closing windows needs pyautogui installed in VAANI's existing environment."
+    start = screen_state.foreground()
+    title = start.get("title") or "that window"
+    short = friendly.short_name(title, "") if title else "the window"
+
+    def alt_f4():
+        pg.hotkey("alt", "f4")
+        return True, ""
+
+    def wm_close():
+        import ctypes
+        hwnd = start.get("hwnd")
+        if not hwnd:
+            return False, "no window handle"
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+        return True, ""
+
+    def close_button():
+        import pc_control
+        return pc_control.uia_click("Close", kinds=("ButtonControl",))
+
+    state = {"dialog": False}
+
+    def check(before, after):
+        now = after["windows"]
+        if title and title not in now:
+            return True, ["window disappeared"]
+        if before["fg"].get("hwnd") != after["fg"].get("hwnd"):      # a new window popped up in front: a save prompt
+            state["dialog"] = True
+            return True, ["a prompt appeared"]
+        return False, []
+
+    ok, _msg, trace = verify.attempt(f"close {short}", [("Alt+F4", alt_f4), ("window close message", wm_close),
+                                                         ("title-bar button", close_button)], check, settle=0.5, timeout=1.5)
+    if not ok:
+        return False, f"{short} didn't close. It may be stuck or asking something I can't see."
+    if state["dialog"]:
+        return True, f"{short} is asking something before it closes. Check the prompt, Chief."
+    return True, f"Closed {short}."
+
+
 def _smart_scroll(direction: str) -> Result:
-    """Scroll for real and only say so when something moved: page scroller first (finds the inner scrolling
-    area that YouTube / Gmail / WhatsApp Web use), then the mouse wheel, then the keyboard."""
+    """Scroll for real and only say so when the screen changed. Tries, in order: the browser extension (finds the inner
+    scrolling area), the mouse wheel over the ACTIVE window, the keyboard, and finally a click-to-focus + keyboard."""
     d = (direction or "down").lower()
     if d not in {"up", "down", "top", "bottom"}:
         d = "down"
-    chrome_front = _is_chrome_title(_foreground_title())
-    if chrome_front and _bridge_ready():
-        ok, payload = _bridge_call("scroll", direction=d)
-        moved = payload.get("moved") if isinstance(payload, dict) else None
-        if ok and moved is not False:
-            return True, friendly.pick("scroll_ok", d=("to the " + d) if d in {"top", "bottom"} else d)
-        log.info("extension scroll did not move the page (%s); using the mouse wheel", payload)
     pg = _pg()
-    if pg is None:
-        return False, "Scrolling needs pyautogui installed."
-    try:
+    chrome_front = _is_chrome_title(_foreground_title())
+    flag = {"moved": False}
+    spoken = ("to the " + d) if d in {"top", "bottom"} else d
+
+    def extension():
+        if not (chrome_front and _bridge_ready()):
+            return False, "extension not available"
+        ok, payload = _bridge_call("scroll", direction=d)
+        if ok and isinstance(payload, dict) and payload.get("moved") is True:
+            flag["moved"] = True
+            return True, ""
+        return False, "page did not move"
+
+    def over_active_window():
+        """The mouse wheel goes to the window UNDER THE CURSOR, so first park the cursor on the active window."""
+        if pg is None:
+            return False, "no pyautogui"
+        r = screen_state.foreground().get("rect") or (0, 0, 0, 0)
+        if r[2] - r[0] > 50:
+            pg.moveTo((r[0] + r[2]) // 2, (r[1] + r[3]) // 2 + 40)
         if d in {"top", "bottom"}:
-            pg.press("home" if d == "top" else "end")
-            for _ in range(3):
-                pg.scroll(2400 if d == "top" else -2400)
+            pg.scroll(30000 if d == "top" else -30000)
         else:
             pg.scroll(600 if d == "up" else -600)
-        return True, friendly.pick("scroll_ok", d=("to the " + d) if d in {"top", "bottom"} else d)
-    except Exception as exc:
-        return False, f"Scrolling failed: {exc}"
+        return True, ""
+
+    def keyboard():
+        if pg is None:
+            return False, "no pyautogui"
+        pg.press({"up": "pageup", "down": "pagedown", "top": "home", "bottom": "end"}[d])
+        return True, ""
+
+    def click_focus_then_keys():
+        if pg is None:
+            return False, "no pyautogui"
+        r = screen_state.foreground().get("rect") or (0, 0, 0, 0)
+        if r[2] - r[0] > 50:
+            pg.click((r[0] + r[2]) // 2, (r[1] + r[3]) // 2)         # focus the page body (harmless on text)
+        pg.press({"up": "pageup", "down": "pagedown", "top": "home", "bottom": "end"}[d])
+        return True, ""
+
+    def check(before, after):
+        if flag["moved"]:
+            return True, ["page scrolled"]
+        return screen_state.diff(before, after, 0.003)
+
+    ok, _msg, _trace = verify.attempt(f"scroll {d}", [("extension", extension), ("mouse wheel", over_active_window),
+                                                     ("keyboard", keyboard), ("click and keyboard", click_focus_then_keys)],
+                                      check, settle=0.35, timeout=1.0)
+    if ok:
+        return True, friendly.pick("scroll_ok", d=spoken)
+    where = {"down": "bottom", "up": "top"}.get(d, d)
+    return False, f"The page didn't move. It may already be at the {where}, Chief."
 
 
 def _volume(direction: str) -> Result:
@@ -608,10 +689,13 @@ def _confirm_or_cancel(text: str) -> Optional[Result]:
                 return False, f"Deletion failed: {exc}"
         if pending.get("action") == "screen_task":
             try:
-                import screen_vision
-                return screen_vision.screen_task(pending["goal"])
+                import desktop_agent
+                return desktop_agent.run(pending["goal"], max_steps=10, announce=_announce, allow_risky=True)
             except Exception as exc:
                 return False, f"Screen task failed: {exc}"
+        if pending.get("action") == "mcp":
+            import mcp_client
+            return mcp_client.call(pending["server"], pending["tool"], pending.get("args") or {})
         if pending.get("action") == "send_whatsapp":
             return _do_whatsapp(pending["contact"], pending["message"])
         return False, "That pending action isn't supported."
@@ -651,14 +735,7 @@ def _execute(plan: dict[str, Any]) -> Optional[Result]:
     if action == "open_app":
         return _open_app(target)
     if action == "close_window":
-        pg = _pg()
-        if pg is None:
-            return False, "Closing windows needs pyautogui installed in VAANI's existing environment."
-        try:
-            pg.hotkey("alt", "f4")
-            return True, "Sent Alt+F4 to close the active window. If it has unsaved work, review its save prompt."
-        except Exception as exc:
-            return False, f"Couldn't close the active window: {exc}"
+        return _close_active_window()
     if action == "switch_window":
         return _run_hotkey("switch_window")
     if action == "minimize_window":
@@ -1494,6 +1571,13 @@ def _gather_context(text: str) -> dict:
     """What Chief is looking at right now: foreground window, current tab, (if relevant) page details, recent exchanges."""
     import datetime
     ctx: dict = {"now": datetime.datetime.now().strftime("%A %I:%M %p")}
+    try:
+        import longmem
+        mem = longmem.context_for(text)
+        if mem:
+            ctx["memory"] = mem
+    except Exception:
+        pass
     fg = _foreground_title()
     if fg:
         ctx["window"] = fg[:120]
@@ -1653,14 +1737,31 @@ def _exec_step(st: dict, ctx: dict) -> Result:
     if do == "screen_task":
         global _pending_action
         try:
-            import screen_vision
-            risky = bool(screen_vision.RISKY.search(st["goal"]))
+            import desktop_agent
+            risky = bool(desktop_agent.RISKY.search(st["goal"]))
         except Exception as exc:
-            return False, f"Screen vision isn't available: {exc}"
+            return False, f"The screen agent isn't available: {exc}"
         if risky:
             _pending_action = {"action": "screen_task", "goal": st["goal"]}
             return True, f"I'm about to do this on your screen: {st['goal']}. That could change or send something. Say confirm to go ahead, or cancel."
-        return screen_vision.screen_task(st["goal"])
+        return desktop_agent.run(st["goal"], max_steps=10, announce=None)
+    if do == "window":
+        import winmgr
+        op_map = {"snap_left": ("snap", "left"), "snap_right": ("snap", "right"), "snap_top": ("snaptb", "top"), "snap_bottom": ("snaptb", "bottom"),
+                  "maximize": ("maximize", ""), "restore": ("restore", ""), "minimize": ("minimize", ""), "show_desktop": ("desktop", ""),
+                  "next_monitor": ("monitor", "next"), "prev_monitor": ("monitor", "previous"), "next_desktop": ("desktopswitch", "next"),
+                  "prev_desktop": ("desktopswitch", "previous"), "new_desktop": ("newdesktop", ""), "task_view": ("taskview", "")}
+        return winmgr.do(*op_map[st["op"]])
+    if do == "timer":
+        import timers
+        timers.add(int(st["seconds"]), st.get("text") or "timer", "reminder" if st.get("text") else "timer")
+        return True, f"Okay, I'll let you know in {timers._say_duration(int(st['seconds']))}."
+    if do == "mcp":
+        import mcp_client
+        if mcp_client.needs_confirm(st["server"], st["tool"]):
+            _pending_action = {"action": "mcp", "server": st["server"], "tool": st["tool"], "args": st.get("args") or {}}
+            return True, f"I'm about to use {st['tool']}. Say confirm to go ahead, or cancel."
+        return mcp_client.call(st["server"], st["tool"], st.get("args") or {})
     # ---- other ----
     if do == "time":
         return _quick_local("what time is it") or (False, "I couldn't read the clock.")

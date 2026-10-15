@@ -1,4 +1,4 @@
-"""Wake phrase detector: waits for 'Hey Computer' (optionally followed by a command) from the OWNER only.
+"""Wake phrase detector: waits for the wake word, "Hey Jarvis" by default (optionally followed by a command) from the OWNER only.
 
 Utterance based (fast + light): it only runs speech recognition after you finish a phrase, instead of
 transcribing every 0.8 s. If voice lock is enrolled, other people's voices are ignored.
@@ -11,10 +11,10 @@ import re
 
 from vaani_control import ListeningPaused, is_paused, shutdown_event
 import voice_input
+import wakeword
 
 log = logging.getLogger("vaani.wake")
-WAKE_PHRASE = "Hey Computer"
-_GREETINGS = {"hey", "hay", "hi", "hello", "okay", "ok", "a", "hate", "he"}
+WAKE_PHRASE = wakeword.display()
 
 
 def wake_model_ready():
@@ -38,16 +38,9 @@ def _words(text: str) -> list:
 
 
 def _wake_result(transcript: str):
-    """False when absent; True for just the phrase; the command text when one follows it."""
-    words = _words(transcript)
-    if len(words) < 2 or words[0] not in _GREETINGS:
-        return False
-    if difflib.SequenceMatcher(None, words[1], "computer").ratio() < 0.78:
-        return False
-    if len(words) == 2:
-        return True
-    rest = " ".join(words[2:])
-    return rest if rest else True
+    """False when absent; True for just the wake word; the command text when one comes with it.
+    The word may be anywhere: "hey jarvis open youtube" and "open youtube hey jarvis" both work."""
+    return wakeword.match(transcript)
 
 
 def wait_for_wake_word():

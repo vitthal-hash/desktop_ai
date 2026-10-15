@@ -14,3 +14,9 @@ sherpa-onnx
 edge-tts
 pycaw; sys_platform == "win32"
 comtypes; sys_platform == "win32"
+uiautomation; sys_platform == "win32"
+psutil
+# --- optional, install only if you want them ---
+# anthropic          (use Claude as the smart model: set ANTHROPIC_API_KEY)
+# mcp                (plug in outside tool servers, see mcp_servers.example.json)
+# kokoro soundfile   (offline neural voice: VAANI_TTS=kokoro)

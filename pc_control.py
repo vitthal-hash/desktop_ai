@@ -60,7 +60,11 @@ def _paste(text: str) -> None:
 
 def _clean(text: str) -> str:
     t = " ".join(text.lower().split()).strip(" .!?,")
-    t = re.sub(r"^(?:hey computer|vaani)[\s,]*", "", t)
+    try:
+        import wakeword
+        t = wakeword.strip_prefix(t).lower()
+    except Exception:
+        t = re.sub(r"^(?:hey computer|vaani)[\s,]*", "", t)
     t = re.sub(r"^(?:please|can you|could you|would you|will you|i want you to|i need you to|go ahead and)\s+", "", t)
     t = re.sub(r"\s+(?:please|for me)$", "", t)
     return t.strip()
@@ -796,8 +800,7 @@ def _single(step: str) -> Optional[Result]:
                 _pg().press("enter")
                 return True, f"Sent your message to {p['contact']}."
             if p["kind"] == "agent":
-                import screen_vision
-                return screen_vision.screen_task(p["goal"], max_steps=10)
+                return agent(p["goal"], confirmed=True)
         if t in {"cancel", "no", "don't send", "do not send", "cancel send", "stop"}:
             _pending = None
             return True, "Cancelled. Nothing was sent."
@@ -948,17 +951,16 @@ RISKY = re.compile(r"\b(delete|remove|erase|format|uninstall|pay|purchase|buy|or
 _UNSUPPORTED = "isn't available in VAANI's safe action list"
 
 
-def agent(goal: str) -> Result:
-    """Last resort: look at the screen, act, look again (up to 10 steps)."""
+def agent(goal: str, confirmed: bool = False) -> Result:
+    """Last resort: read the real controls of the screen, act on them one at a time, verify each step, repeat."""
     global _pending
-    if RISKY.search(goal):
+    if RISKY.search(goal) and not confirmed:
         _pending = {"kind": "agent", "goal": goal}
         return True, f"That could change or send something. I'll do '{goal[:80]}' on the screen only if you say confirm."
     try:
-        import screen_vision
-        if not os.getenv("GEMINI_API_KEY", "").strip():
-            return False, "The step-by-step screen agent needs the Gemini key in .env. Single clicks work locally."
-        return screen_vision.screen_task(goal, max_steps=10)
+        import desktop_agent
+        import tools
+        return desktop_agent.run(goal, max_steps=10, announce=tools._announce, allow_risky=confirmed)
     except Exception as e:
         return False, f"Screen agent failed: {e}"
 

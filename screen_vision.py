@@ -40,39 +40,13 @@ def _capture(max_side: int = 1600):
 
 
 def _ask(prompt: str, png: bytes, want_json: bool = True):
-    """Returns (data, error). Exactly one is None."""
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key:
-        return None, "Screen vision needs GEMINI_API_KEY set in VAANI's environment."
-    try:
-        from google import genai
-        from google.genai import types
-    except ImportError:
-        return None, "Screen vision needs the google-genai package (pip install google-genai)."
-    client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=30000))
-    last = "no model answered"
-    for model in _models():
-        try:
-            cfg = {"temperature": 0}
-            if want_json:
-                cfg["response_mime_type"] = "application/json"
-            r = client.models.generate_content(
-                model=model, config=cfg,
-                contents=[types.Part.from_bytes(data=png, mime_type="image/png"), prompt])
-            text = (r.text or "").strip()
-            if not text:
-                last = f"{model}: empty response"
-                continue
-            if not want_json:
-                return text, None
-            data = json.loads(text)
-            if isinstance(data, list) and data:
-                data = data[0]
-            return data, None
-        except Exception as exc:
-            last = f"{model}: {type(exc).__name__}: {str(exc)[:160]}"
-            log.warning("vision call failed: %s", last)
-    return None, f"Vision request failed ({last})"
+    """Returns (data, error). Exactly one is None. Uses Claude, Gemini or a local vision model, whichever is set up."""
+    import llm
+    if not llm.can_see():
+        return None, ("I need a model that can see images for that. Add ANTHROPIC_API_KEY or GEMINI_API_KEY to .env, "
+                      "or set VAANI_OLLAMA_VISION=qwen2.5vl:7b.")
+    return llm.ask("You are VAANI's eyes. Look at the screenshot and answer exactly what was asked.", prompt, png,
+                   tier="smart", want_json=want_json)
 
 
 def _center(box, full):
@@ -81,7 +55,24 @@ def _center(box, full):
     return int((xmin + xmax) / 2000 * full[0]), int((ymin + ymax) / 2000 * full[1])
 
 
+def _describe_from_controls() -> tuple[bool, str]:
+    """No vision model available: describe the active window from its real controls (UI Automation)."""
+    import screen_state as ss
+    fg = ss.foreground()
+    els = ss.elements(40)
+    if not fg.get("title") and not els:
+        return False, "I can't read the screen without a vision model or UI Automation."
+    names = [e["name"] for e in els if e["name"]][:10]
+    text = f"You're in {fg.get('title') or 'an app'}."
+    if names:
+        text += " I can see: " + ", ".join(names[:8]) + "."
+    return True, text
+
+
 def describe(question: str = "") -> tuple[bool, str]:
+    import llm
+    if not llm.can_see():
+        return _describe_from_controls()
     try:
         png, _ = _capture()
     except Exception as exc:
