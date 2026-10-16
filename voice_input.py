@@ -234,27 +234,49 @@ def transcribe(model, audio_16k: np.ndarray, fast: bool = True, english: bool = 
     if fast:
         segments, _ = model.transcribe(audio_16k, beam_size=1, **kwargs)
     else:
-        hints = ""
-        try:
-            import vocab
-            hints = ", ".join(vocab.hint_words())[:300]
-        except Exception:
-            pass
-        prompt = (PROMPT + " " + hints).strip()
-        try:                                              # hotwords nudges Whisper toward YOUR names (newer faster-whisper)
-            segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, initial_prompt=prompt,
-                                           hotwords=hints or None, **kwargs)
-        except TypeError:
-            segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, initial_prompt=prompt, **kwargs)
-    segs = list(segments)
+        # A "prompt" or "hotwords" list makes Whisper blurt those words out on silence/noise, so they are OFF by default.
+        # Names are fixed AFTER recognition by vocab.apply() instead. Opt in with VAANI_STT_HINTS=1 only if you accept that.
+        if os.getenv("VAANI_STT_HINTS", "").strip().lower() in {"1", "true", "yes", "on"}:
+            hints = ""
+            try:
+                import vocab
+                hints = ", ".join(vocab.hint_words())[:300]
+            except Exception:
+                pass
+            segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, initial_prompt=(PROMPT + " " + hints).strip(), **kwargs)
+        else:
+            segments, _ = model.transcribe(_prepare(audio_16k), beam_size=BEAM, **kwargs)
+    segs = [s for s in segments
+            if not (getattr(s, "no_speech_prob", 0.0) > 0.6 and getattr(s, "avg_logprob", 0.0) < -1.0)]   # "heard" only noise
     lp = [s.avg_logprob for s in segs if getattr(s, "avg_logprob", None) is not None]
     last_confidence = (sum(lp) / len(lp)) if lp else None
     text = " ".join(s.text.strip() for s in segs).strip()
     if text.lower().strip(" .!?,") in HALLUCINATIONS:
         return ""
-    if not fast and PROMPT and text.strip().lower() in PROMPT.lower() and len(text.split()) > 6:
-        return ""                                   # Whisper sometimes just echoes its own prompt on silence
+    if not fast and _looks_hallucinated(text):
+        log.info("dropped a hallucinated transcript: %r", text[:80])
+        return ""
     return text
+
+
+def _looks_hallucinated(text: str) -> bool:
+    """Whisper invents text on silence. Catches the same word over and over ("chashmah chashmah chashmah"), and - only when
+    the optional hint list is switched on - a transcript made of nothing but those hint words."""
+    toks = [t for t in "".join(c if c.isalnum() else " " for c in text.lower()).split() if t]
+    if len(toks) >= 3:
+        most = max(toks.count(t) for t in set(toks))
+        if most >= 3 and most / len(toks) >= 0.6:
+            return True
+    if os.getenv("VAANI_STT_HINTS", "").strip().lower() in {"1", "true", "yes", "on"} and len(toks) >= 3:
+        try:
+            import vocab
+            vw = {t for w in vocab.hint_words() for t in "".join(c if c.isalnum() else " " for c in w.lower()).split()}
+            vw |= {t for t in "".join(c if c.isalnum() else " " for c in PROMPT.lower()).split()}
+            if all(t in vw for t in toks):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _norm_words(t: str) -> str:

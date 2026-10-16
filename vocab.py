@@ -38,25 +38,31 @@ def hint_words() -> list:
 
 
 def apply(text: str) -> str:
+    """Fix mis-heard names. Safe to run twice: a name that is already correct is left alone."""
     _load()
     aliases = _cache["aliases"]
     if not text or not aliases:
         return text
     out = text
+    # protect names that are ALREADY correct, so "taarak mehta" -> full title never doubles up on text that has it
+    canon = sorted(set(aliases.values()), key=len, reverse=True)
+    for i, c in enumerate(canon):
+        out = re.sub(re.escape(c), f"\u2063P{i}\u2063", out, flags=re.I)
     # 1) phrases / spaced-out letters, longest first ("t m k o c", "tm koc")
     for key in sorted(aliases, key=len, reverse=True):
         loose = r"[\s.\-]*".join(re.escape(ch) for ch in key.replace(" ", "")) if len(key.replace(" ", "")) <= 6 else re.escape(key)
-        out = re.sub(rf"(?<![A-Za-z0-9]){loose}(?![A-Za-z0-9])", aliases[key], out, flags=re.I)
+        out = re.sub(rf"(?<![A-Za-z0-9]){loose}(?![A-Za-z0-9])", lambda m, k=key: aliases[k], out, flags=re.I)
     # 2) single close misspellings of an alias ("tmqk", "tmcok"): token must look like an acronym/short unknown word
     singles = [k for k in aliases if " " not in k and len(k) >= 3]
-    tokens = re.findall(r"[A-Za-z0-9']+", out)
-    for tok in set(tokens):
+    for tok in set(re.findall(r"[A-Za-z0-9']+", out)):
         low = tok.lower()
         if len(low) < 3 or len(low) > 8 or low in aliases:
             continue
         match = difflib.get_close_matches(low, singles, n=1, cutoff=0.75)
         if match and (low.isalpha() and (not re.search(r"[aeiou]", low) or len(low) <= 5)):   # acronym-like, not a normal word
-            out = re.sub(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])", aliases[match[0]], out)
+            out = re.sub(rf"(?<![A-Za-z0-9]){re.escape(tok)}(?![A-Za-z0-9])", lambda m, k=match[0]: aliases[k], out)
+    for i, c in enumerate(canon):                                  # put the protected names back
+        out = out.replace(f"\u2063P{i}\u2063", c)
     return out
 
 

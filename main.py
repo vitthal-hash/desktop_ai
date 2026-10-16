@@ -17,6 +17,7 @@ import features
 import interrupt
 import longmem
 import barge
+import earcon
 import timers
 import mcp_client
 import tools
@@ -74,16 +75,55 @@ def _configure_logging():
         pass
 
 
+_streamed_spoken = False          # True when answer_question already said the reply out loud, sentence by sentence
+
+
+def _sentences_ready(buf: str):
+    """Split off complete sentences from a growing text buffer -> (ready_sentences, leftover)."""
+    out, start = [], 0
+    for m_ in re.finditer(r"[.!?]+(?:\s+|$)|\n+", buf):
+        piece = buf[start:m_.end()].strip()
+        if len(piece) >= 18 or (piece and m_.group(0).startswith("\n")):
+            out.append(piece)
+            start = m_.end()
+    return out, buf[start:]
+
+
 def answer_question(user_text: str, mood: str | None = None) -> str:
+    """Chat answer. Speaks as it generates (first sentence within about a second) so it feels like talking, not waiting."""
+    global _streamed_spoken
     messages.append({"role": "user", "content": user_text})
+    _streamed_spoken = False
     try:
         call_messages = list(messages)
         hint = friendly.mood_hint(mood) if mood else ""
         if hint:                                          # only for this one call, not kept in the history
             call_messages.append({"role": "system", "content": hint})
-        response = ollama.chat(model=MODEL, messages=call_messages, keep_alive="30m",
-                               options={"temperature": 0.5, "num_predict": 220})
-        answer = (response.message.content or "").strip() or "I couldn't generate a response, Chief."
+        try:
+            mem = longmem.context_for(user_text)
+        except Exception:
+            mem = ""
+        if mem:
+            call_messages.append({"role": "system", "content": "Things you know about Chief: " + mem})
+        stream = ollama.chat(model=MODEL, messages=call_messages, keep_alive="30m", stream=True,
+                             options={"temperature": 0.5, "num_predict": 220})
+        full, buf, said_any = "", "", False
+        for part in stream:
+            if interrupt.cancelled():
+                break
+            token = (part.message.content or "") if getattr(part, "message", None) else ""
+            full += token
+            buf += token
+            ready, buf = _sentences_ready(buf)
+            for sentence in ready:
+                if os.getenv("VAANI_STREAM_SPEECH", "1").strip().lower() not in {"0", "off", "false", "no"}:
+                    _say(sentence)
+                    said_any = True
+        if buf.strip() and not interrupt.cancelled() and os.getenv("VAANI_STREAM_SPEECH", "1").strip().lower() not in {"0", "off", "false", "no"}:
+            _say(buf.strip())
+            said_any = True
+        _streamed_spoken = said_any
+        answer = full.strip() or "I couldn't generate a response, Chief."
         messages.append({"role": "assistant", "content": answer})
         logging.info("CHAT: %s => %s", user_text, answer)
         return answer
@@ -110,7 +150,7 @@ def _run_one(cmd: str):
 
 # failures that are NOT worth handing to the screen agent (missing packages, questions, confirmations...)
 _NO_ESCALATE = re.compile(r"\b(confirm|cancel|install|installed|paused|api key|not configured|isn't available|isn't allowed|"
-                          r"say |tell me|which |what should|should i|how long|when should|more or less|up or down|are you sure)\b", re.I)
+                          r"say |tell me|which |what should|should i|how long|when should|more or less|up or down|are you sure|already)\b", re.I)
 
 
 def _should_escalate(text: str, detail: str) -> bool:
@@ -236,6 +276,7 @@ def _say(text: str):
                 speak(text)
     except Exception:
         logging.exception("Speech output failed")
+        print("[VAANI] I couldn't speak that reply: no voice worked. Run  python diagnose.py voice  to find out why.", flush=True)
 
 
 def _maybe_confirm(command: str):
@@ -277,10 +318,14 @@ def process_one_request(user_text: str) -> str:
     except Exception:
         logging.exception("handle_request crashed")
         reply = "Sorry, Chief, something went wrong with that one. Please try again."
+    global _streamed_spoken
     if reply:
         print(f"\nVAANI: {reply}\n", flush=True)
-        set_status("speaking", "Speaking a response")
-        _say(reply)
+        if _streamed_spoken:                                # chat answers were already spoken as they were written
+            _streamed_spoken = False
+        else:
+            set_status("speaking", "Speaking a response")
+            _say(reply)
     return reply
 
 
@@ -399,6 +444,7 @@ def run_wake_mode() -> None:
             if isinstance(detected, str):
                 run_command_session(detected)
             else:
+                earcon.listening()                          # a soft "ding": I'm listening
                 try:
                     first_command = listen_once(auto_stop=True, max_wait_seconds=12)
                 except ListeningPaused:

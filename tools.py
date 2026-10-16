@@ -542,63 +542,26 @@ def _close_active_window() -> Result:
 
 
 def _smart_scroll(direction: str) -> Result:
-    """Scroll for real and only say so when the screen changed. Tries, in order: the browser extension (finds the inner
-    scrolling area), the mouse wheel over the ACTIVE window, the keyboard, and finally a click-to-focus + keyboard."""
+    """Scroll and PROVE the page moved. Methods (see scrolling.py): browser extension, wheel message, mouse wheel, keyboard.
+    Success is judged by measuring that the screen content really slid, not by "something changed" (a video would fool that)."""
+    import scrolling
     d = (direction or "down").lower()
     if d not in {"up", "down", "top", "bottom"}:
         d = "down"
-    pg = _pg()
     chrome_front = _is_chrome_title(_foreground_title())
-    flag = {"moved": False}
-    spoken = ("to the " + d) if d in {"top", "bottom"} else d
 
-    def extension():
+    def extension(dd: str) -> bool:
         if not (chrome_front and _bridge_ready()):
-            return False, "extension not available"
-        ok, payload = _bridge_call("scroll", direction=d)
-        if ok and isinstance(payload, dict) and payload.get("moved") is True:
-            flag["moved"] = True
-            return True, ""
-        return False, "page did not move"
+            return False
+        ok, payload = _bridge_call("scroll", direction=dd)
+        return bool(ok and isinstance(payload, dict) and payload.get("moved") is True)
 
-    def over_active_window():
-        """The mouse wheel goes to the window UNDER THE CURSOR, so first park the cursor on the active window."""
-        if pg is None:
-            return False, "no pyautogui"
-        r = screen_state.foreground().get("rect") or (0, 0, 0, 0)
-        if r[2] - r[0] > 50:
-            pg.moveTo((r[0] + r[2]) // 2, (r[1] + r[3]) // 2 + 40)
-        if d in {"top", "bottom"}:
-            pg.scroll(30000 if d == "top" else -30000)
-        else:
-            pg.scroll(600 if d == "up" else -600)
-        return True, ""
-
-    def keyboard():
-        if pg is None:
-            return False, "no pyautogui"
-        pg.press({"up": "pageup", "down": "pagedown", "top": "home", "bottom": "end"}[d])
-        return True, ""
-
-    def click_focus_then_keys():
-        if pg is None:
-            return False, "no pyautogui"
-        r = screen_state.foreground().get("rect") or (0, 0, 0, 0)
-        if r[2] - r[0] > 50:
-            pg.click((r[0] + r[2]) // 2, (r[1] + r[3]) // 2)         # focus the page body (harmless on text)
-        pg.press({"up": "pageup", "down": "pagedown", "top": "home", "bottom": "end"}[d])
-        return True, ""
-
-    def check(before, after):
-        if flag["moved"]:
-            return True, ["page scrolled"]
-        return screen_state.diff(before, after, 0.003)
-
-    ok, _msg, _trace = verify.attempt(f"scroll {d}", [("extension", extension), ("mouse wheel", over_active_window),
-                                                     ("keyboard", keyboard), ("click and keyboard", click_focus_then_keys)],
-                                      check, settle=0.35, timeout=1.0)
+    ok, how = scrolling.scroll(d, extension=extension)
+    spoken = ("to the " + d) if d in {"top", "bottom"} else d
     if ok:
+        logging.getLogger("vaani.tools").info("scroll %s worked via %s", d, how)
         return True, friendly.pick("scroll_ok", d=spoken)
+    logging.getLogger("vaani.tools").warning("scroll %s failed: %s", d, how)
     where = {"down": "bottom", "up": "top"}.get(d, d)
     return False, f"The page didn't move. It may already be at the {where}, Chief."
 

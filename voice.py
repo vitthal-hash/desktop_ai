@@ -48,7 +48,6 @@ MAX_CHUNK = 220
 _stop = threading.Event()
 _proc = None
 _engine = None
-_edge_failed_until = 0.0
 _lock = threading.Lock()
 
 
@@ -196,35 +195,121 @@ def _say_powershell(chunks: list) -> None:
 
 
 # --------------------------------------------------------------- edge backend
+_edge_seq = 0
+_reach = {"t": 0.0, "ok": False}
+
+
+def _edge_reachable() -> bool:
+    """Cheap internet check (1.5 s, cached for a minute) so an offline PC skips the neural voice instantly."""
+    import socket
+    if time.time() - _reach["t"] < 60:
+        return _reach["ok"]
+    try:
+        socket.create_connection(("speech.platform.bing.com", 443), timeout=1.5).close()
+        _reach.update(t=time.time(), ok=True)
+    except OSError:
+        _reach.update(t=time.time(), ok=False)
+    return _reach["ok"]
+
+
+def _mci(cmd: str) -> None:
+    import ctypes
+    buf = ctypes.create_unicode_buffer(256)
+    rc = ctypes.windll.winmm.mciSendStringW(cmd, buf, 255, 0)
+    if rc != 0:
+        err = ctypes.create_unicode_buffer(256)
+        ctypes.windll.winmm.mciGetErrorStringW(rc, err, 255)
+        raise RuntimeError(f"audio player error {rc}: {err.value}")
+
+
 def _say_edge(chunk: str) -> None:                                        # needs: pip install edge-tts
-    import asyncio, tempfile
+    """Neural voice. Raises (so the next backend takes over) on ANY problem: offline, no file, player error."""
+    global _edge_seq
+    import asyncio
+    import tempfile
     import edge_tts
-    voice = VOICE_PREF if "-" in VOICE_PREF else "en-IN-NeerjaNeural"      # female (Indian English)
-    path = os.path.join(tempfile.gettempdir(), f"vaani_tts_{os.getpid()}.mp3")
+    if not sys.platform.startswith("win"):
+        raise RuntimeError("edge playback is Windows-only here")
+    if not _edge_reachable():
+        raise RuntimeError("no internet route to the neural voice service")
+    voice = VOICE_PREF if "-" in VOICE_PREF else os.getenv("VAANI_EDGE_VOICE", "en-IN-NeerjaNeural")
+    _edge_seq += 1
+    path = os.path.join(tempfile.gettempdir(), f"vaani_tts_{os.getpid()}_{_edge_seq}.mp3")
     try:
         comm = edge_tts.Communicate(chunk, voice, rate=EDGE_RATE, pitch=EDGE_PITCH)
     except TypeError:
         comm = edge_tts.Communicate(chunk, voice)
-    asyncio.run(comm.save(path))
-    import ctypes
-    mci = ctypes.windll.winmm.mciSendStringW
-    mci('close vaani', None, 0, 0)
-    mci(f'open "{path}" type mpegvideo alias vaani', None, 0, 0)
-    mci(f'setaudio vaani volume to {int(VOLUME * 1000)}', None, 0, 0)
-    mci('play vaani wait', None, 0, 0)
-    mci('close vaani', None, 0, 0)
 
-
-def _speak_chunk(chunk: str) -> None:
-    """One phrase through edge (if selected) or pyttsx3."""
-    global _edge_failed_until
-    if BACKEND == "edge" and time.time() >= _edge_failed_until:
+    async def go():
+        await asyncio.wait_for(comm.save(path), timeout=12)
+    asyncio.run(go())
+    if not os.path.exists(path) or os.path.getsize(path) < 800:
+        raise RuntimeError("the neural voice returned no audio")
+    try:
         try:
-            return _say_edge(chunk)
-        except Exception as exc:
-            log.warning("edge-tts failed (%s); using the offline voice for a while", exc)
-            _edge_failed_until = time.time() + 120
-    _say_pyttsx3(chunk)
+            _mci("close vaani")
+        except RuntimeError:
+            pass
+        _mci(f'open "{path}" type mpegvideo alias vaani')
+        _mci(f"setaudio vaani volume to {int(VOLUME * 1000)}")
+        _mci("play vaani wait")
+    finally:
+        try:
+            _mci("close vaani")
+        except RuntimeError:
+            pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+_FAIL: dict = {}                    # backend name -> time.time() until which it is skipped
+_told: set = set()
+
+
+def _backend_order() -> list:
+    """Which voices to try, best first. Anything that failed recently is skipped for a while."""
+    chains = {"edge": ["edge", "ps", "pyttsx3"], "kokoro": ["kokoro", "edge", "ps", "pyttsx3"],
+              "auto": ["ps", "pyttsx3"], "ps": ["ps"], "pyttsx3": ["pyttsx3"]}
+    names = chains.get(BACKEND, ["ps", "pyttsx3"])
+    if not sys.platform.startswith("win"):
+        names = [n for n in names if n != "ps"]
+    now = time.time()
+    ready = [n for n in names if _FAIL.get(n, 0) <= now]
+    return ready or names
+
+
+def _mark_failed(name: str, exc: Exception) -> None:
+    _FAIL[name] = time.time() + (300 if name in {"edge", "kokoro"} else 45)
+    log.warning("voice backend %s failed: %s: %s", name, type(exc).__name__, str(exc)[:200])
+    if name not in _told:
+        _told.add(name)
+        label = {"edge": "neural", "kokoro": "Kokoro", "ps": "Windows", "pyttsx3": "backup"}.get(name, name)
+        print(f"[VAANI] The {label} voice didn't work ({str(exc)[:90]}). Trying another voice.", flush=True)
+
+
+def _run_backend(name: str, pending: list) -> None:
+    """Speak what is left in `pending` (list of (text, pause)); remove items as they finish."""
+    if name == "ps":
+        _say_powershell(pending)
+        pending.clear()
+    elif name == "kokoro":
+        _speak_kokoro(pending)
+        pending.clear()
+    elif name == "edge":
+        pending[:] = _merge_for_edge(pending)
+        while pending and not _stop.is_set():
+            text, _pause = pending[0]
+            _say_edge(text)
+            pending.pop(0)
+    else:                                                                  # pyttsx3
+        while pending and not _stop.is_set():
+            text, pause = pending[0]
+            _say_pyttsx3(text)
+            pending.pop(0)
+            if pause:
+                _sleep(pause)
 
 
 def _merge_for_edge(chunks: list) -> list:
@@ -273,50 +358,33 @@ def _speak_kokoro(chunks: list) -> None:
                 return
 
 
-def _speak_chunks_one_by_one(chunks: list) -> None:
-    if BACKEND == "edge" and time.time() >= _edge_failed_until:
-        chunks = _merge_for_edge(chunks)
-    for chunk, pause in chunks:
-        if _stop.is_set():
-            break
-        _speak_chunk(chunk)
-        if pause and not _stop.is_set():
-            _sleep(pause)
-
-
 # ----------------------------------------------------------------- public API
 def speak(text: str) -> None:
-    global BACKEND
+    """Say it out loud. Tries the best voice first and falls back automatically; only raises if EVERY voice fails."""
     clean = clean_for_speech(text)
     if not clean:
         return
-    chunks = split_chunks(clean)
+    pending = split_chunks(clean)
     _last["text"], _last["t"] = clean, time.monotonic()          # set early too: the echo starts while we are still talking
     with _lock:
         _stop.clear()
         log.info("speaking (%s): %s", BACKEND, clean[:120].replace("\n", " "))
-        try:
-            if BACKEND in ("auto", "ps") and sys.platform.startswith("win"):
-                try:
-                    _say_powershell(chunks)
-                except Exception as exc:
-                    log.error("PowerShell speech failed: %s", exc)
-                    if BACKEND == "ps":
-                        raise
-                    log.info("falling back to pyttsx3")
-                    _speak_chunks_one_by_one(chunks)
-            elif BACKEND == "kokoro":
-                try:
-                    _speak_kokoro(chunks)
-                except Exception as exc:
-                    log.error("Kokoro voice failed (%s: %s); switching to the normal voice", type(exc).__name__, str(exc)[:120])
-                    BACKEND = _default_backend()
-                    _speak_chunks_one_by_one(chunks)
-            else:
-                _speak_chunks_one_by_one(chunks)
-        except Exception:
-            log.exception("SPEECH FAILED - nothing was said")
-            raise
+        last_exc = None
+        for name in _backend_order():
+            if _stop.is_set() or not pending:
+                break
+            try:
+                _run_backend(name, pending)
+                last_exc = None
+                break
+            except Exception as exc:
+                if _stop.is_set():
+                    break
+                last_exc = exc
+                _mark_failed(name, exc)
+        if last_exc is not None and pending:
+            log.error("SPEECH FAILED on every voice - nothing was said")
+            raise RuntimeError(f"no voice worked: {last_exc}")
         _last["text"], _last["t"] = clean, time.monotonic()
         time.sleep(0.2)                                                    # let the speaker tail die before the mic opens
 
@@ -329,6 +397,12 @@ def stop_speaking() -> None:
     except Exception:
         pass
     try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            ctypes.windll.winmm.mciSendStringW("stop vaani", None, 0, 0)
+    except Exception:
+        pass
+    try:
         if _proc is not None:
             _proc.terminate()
         if _engine is not None:
@@ -337,6 +411,24 @@ def stop_speaking() -> None:
         pass
 
 
+def test_voices() -> None:
+    """python voice.py   ->  tries every voice one by one and says which ones work on THIS PC."""
+    print("Testing each voice. Listen, and note which ones you can hear.\n")
+    results = {}
+    for name, label in (("ps", "Windows voice"), ("edge", "Neural voice (needs internet)"), ("pyttsx3", "Backup voice"), ("kokoro", "Kokoro offline neural voice")):
+        if name == "ps" and not sys.platform.startswith("win"):
+            continue
+        _stop.clear()
+        pending = [(f"This is the {label}. Can you hear me, Chief?", 0.0)]
+        try:
+            _run_backend(name, pending)
+            results[name] = "worked (did you HEAR it?)"
+        except Exception as exc:
+            results[name] = f"FAILED: {type(exc).__name__}: {str(exc)[:120]}"
+        print(f"  {label:36} {results[name]}")
+    print("\nPut the best one in .env:  VAANI_TTS=edge   (neural, needs internet)   or   VAANI_TTS=ps   (Windows voice, offline)")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    speak("Good evening, Chief. What are your orders for me? I can open apps, control Chrome, and answer questions.")
+    test_voices()
